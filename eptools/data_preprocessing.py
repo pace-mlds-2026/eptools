@@ -47,11 +47,10 @@ def load_dataframes(data_path=None) -> dict:
             data_path = _find_local_data_path()
             if data_path is None:
                 raise EnvironmentError(
-                    "Could not find the DATA directory automatically.
-"
-                    "Either set the EPTOOLS_DATA_PATH environment variable or pass data_path explicitly:
-"
-                    "    load_dataframes(data_path='/path/to/DATA')"
+                    "Could not find the DATA directory automatically. "
+                    "Set the EPTOOLS_DATA_PATH environment variable, "
+                    "or pass data_path explicitly: "
+                    "load_dataframes(data_path='/path/to/DATA')"
                 )
 
     sales_df      = pd.read_csv(os.path.join(data_path, "chile_suzuki_historical_sales.csv"))
