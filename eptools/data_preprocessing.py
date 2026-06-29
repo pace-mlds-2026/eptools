@@ -154,6 +154,18 @@ def get_collision_sales_df():
 
     return sales.drop(columns=["collision_flag_clean", "is_collision"])
 
+# get the dictionary and strip out the redundant column information
+def get_collision_sales_dictionary():
+    dfs = load_dataframes()
+    dictionary = dfs['dictionary']
+    return dictionary[~dictionary["column_name"].isin(REDUNDANT_COLUMNS)]
+
+        
+    
+
+
+
+print(get_collision_sales_dictionary())
 
 
 def get_moirai_wide_format_df():
