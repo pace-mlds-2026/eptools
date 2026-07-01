@@ -206,6 +206,7 @@ def get_vehicle_sales(data_path=None) -> pd.DataFrame:
 
     Returns:
         DataFrame loaded from ANAC-vehicle-sales/suzuki_light_medium_monthly.csv
+        with a DatetimeIndex on the Date column.
     """
     resolved = _resolve_data_path(data_path)
     cache_key = resolved + "/__anac_vehicle_sales__"
@@ -215,6 +216,7 @@ def get_vehicle_sales(data_path=None) -> pd.DataFrame:
 
     file_path = os.path.join(resolved, "ANAC-vehicle-sales", "suzuki_light_medium_monthly.csv")
     df = pd.read_csv(file_path)
+    df['Date'] = pd.to_datetime(df['Date'])
+    df = df.set_index('Date')
     _DATAFRAMES_CACHE[cache_key] = _freeze(df)
     return _DATAFRAMES_CACHE[cache_key].copy()
-
