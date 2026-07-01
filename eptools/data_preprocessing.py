@@ -165,9 +165,6 @@ def get_collision_sales_dictionary():
 
 
 
-print(get_collision_sales_dictionary())
-
-
 def get_moirai_wide_format_df():
 
     collision_sales = get_collision_sales_df()
