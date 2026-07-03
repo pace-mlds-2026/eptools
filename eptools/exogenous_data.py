@@ -61,7 +61,7 @@ def get_suzuki_vehicle_sales_annual_2008_2013(data_path=None) -> pd.DataFrame:
 
     file_path = os.path.join(resolved, "ANAC-vehicle-sales", "suzuki_light_medium_annual_2008_2013.csv")
     df = pd.read_csv(file_path)
-    df['Date'] = pd.to_datetime(df['Date'])
+    df['Date'] = pd.to_datetime(df['Date'].astype(str), format='%Y')
     df = df.set_index('Date')
     _DATAFRAMES_CACHE[cache_key] = _freeze(df)
     return _DATAFRAMES_CACHE[cache_key].copy()
