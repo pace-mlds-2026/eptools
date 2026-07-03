@@ -3,7 +3,7 @@ import pandas as pd
 from eptools.data_preprocessing import _DATAFRAMES_CACHE, _resolve_data_path, _freeze
 
 
-def get_vehicle_sales(data_path=None) -> pd.DataFrame:
+def get_suzuki_sales_post_2014(data_path=None) -> pd.DataFrame:
     """
     Load the ANAC Suzuki light/medium monthly vehicle sales data.
 
@@ -33,3 +33,38 @@ def get_vehicle_sales(data_path=None) -> pd.DataFrame:
     df = df.set_index('Date')
     _DATAFRAMES_CACHE[cache_key] = _freeze(df)
     return _DATAFRAMES_CACHE[cache_key].copy()
+
+
+_SOURCES = {
+    "suzuki_sales_monthly_post_2014": get_suzuki_sales_post_2014,
+}
+
+
+def get_exog(name=None):
+    """
+    Discover or fetch exogenous data sources.
+
+    Called with no arguments, returns a list of available source names.
+    Called with name=<source>, returns the corresponding DataFrame.
+
+    Args:
+        name: Name of the data source to fetch. If None, lists available sources.
+
+    Returns:
+        List of source name strings (when name is None), or a DataFrame.
+
+    Example — list sources:
+        get_exog()                     # ['suzuki_sales']
+
+    Example — fetch one source:
+        df = get_exog(name='suzuki_sales')
+
+    Example — fetch all sources:
+        for name in get_exog():
+            df = get_exog(name=name)
+    """
+    if name is None:
+        return list(_SOURCES)
+    if name not in _SOURCES:
+        raise ValueError(f"Unknown source {name!r}. Available: {list(_SOURCES)}")
+    return _SOURCES[name]()
