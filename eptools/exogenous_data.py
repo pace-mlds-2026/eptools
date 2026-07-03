@@ -3,7 +3,7 @@ import pandas as pd
 from eptools.data_preprocessing import _DATAFRAMES_CACHE, _resolve_data_path, _freeze
 
 
-def get_suzuki_sales_post_2014(data_path=None) -> pd.DataFrame:
+def get_suzuki_vehicle_sales_monthly_post_2014(data_path=None) -> pd.DataFrame:
     """
     Load the ANAC Suzuki light/medium monthly vehicle sales data.
 
@@ -36,7 +36,7 @@ def get_suzuki_sales_post_2014(data_path=None) -> pd.DataFrame:
 
 
 _SOURCES = {
-    "suzuki_sales_monthly_post_2014": get_suzuki_sales_post_2014,
+    "suzuki_vehicle_sales_monthly_post_2014": get_suzuki_vehicle_sales_monthly_post_2014,
 }
 
 
