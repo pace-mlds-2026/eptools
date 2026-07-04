@@ -209,6 +209,3 @@ def get_bodywork_skus():
     return all_skus_flagged_as_bodywork
 
     
-
-
-get_bodywork_skus()

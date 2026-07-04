@@ -201,7 +201,3 @@ def list_exog_fields(group, data_path=None):
     """
     df = get_exog(group, data_path=data_path)
     return list(df.columns)
-
-
-for group in get_exog():
-    display(get_exog(group))
