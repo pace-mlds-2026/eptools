@@ -160,6 +160,7 @@ def get_collision_sales_dictionary():
     dictionary = dfs['dictionary']
     return dictionary[~dictionary["column_name"].isin(REDUNDANT_COLUMNS)]
 
+
         
     
 
@@ -188,3 +189,26 @@ def get_moirai_wide_format_df():
 
     return wide_df
 
+
+
+def get_bare_sku_df(sku_code):
+    all_months = pd.date_range('2021-01-01', '2026-04-01', freq="MS", name='date')
+    sku_sales = load_dataframes()['sales'][['Date', 'value', 'ts_id']].query('ts_id == @sku_code')
+    sku_sales['Date'] = pd.to_datetime(sku_sales['Date'])
+    sku_sales = sku_sales.set_index('Date')[['value']].reindex(all_months, fill_value=0)
+    if len(sku_sales) == 0:
+        raise ValueError(f'SKU not found: {sku_code}')
+    missing_months = len(all_months) - len(sku_sales)
+    if missing_months > 0:
+        print(f"WARNING: {missing_months} months were missing data and defaulted to 0")
+    return sku_sales
+
+
+def get_bodywork_skus():
+    all_skus_flagged_as_bodywork = load_dataframes()["sales"].query('FAMILY_DESCRIPTION == "CARROCERIA"')['ts_id'].unique()
+    return all_skus_flagged_as_bodywork
+
+    
+
+
+get_bodywork_skus()
