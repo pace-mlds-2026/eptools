@@ -229,6 +229,9 @@ def get_bare_sku_df(sku_code, format=None, no_warnings=False, _sales=None):
     return sku_sales
 
 
+get_bare_sku_df('015500620A000')
+
+
 def get_bodywork_skus():
     all_skus_flagged_as_bodywork = load_dataframes()["sales"].query('FAMILY_DESCRIPTION == "CARROCERIA"')['ts_id'].unique()
     return all_skus_flagged_as_bodywork
@@ -255,7 +258,7 @@ def rebuild_nixtla_df():
         frames.append(temp_df)
 
     nixtla = pd.concat(frames, sort=False)
-    nixtla.index = nixtla.index.rename('ds')
+    nixtla = nixtla.rename({'date': 'ds'}) 
 
     out_path = os.path.join(_resolve_data_path(), 'API_SOURCES', 'API_SOURCE_nixtla.parquet')
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -275,3 +278,6 @@ def get_nixtla_df():
             f"Nixtla parquet not found at {path}. Run rebuild_nixtla_df() to generate it."
         )
     return pd.read_parquet(path)
+
+
+rebuild_nixtla_df()
