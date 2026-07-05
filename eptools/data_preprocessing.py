@@ -277,3 +277,6 @@ def get_nixtla_df():
             f"Nixtla parquet not found at {path}. Run rebuild_nixtla_df() to generate it."
         )
     return pd.read_parquet(path)
+
+
+get_nixtla_df().columns
