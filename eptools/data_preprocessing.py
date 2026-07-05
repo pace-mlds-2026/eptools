@@ -191,21 +191,90 @@ def get_moirai_wide_format_df():
 
 
 
-def get_bare_sku_df(sku_code):
-    all_months = pd.date_range('2021-01-01', '2026-04-01', freq="MS", name='date')
-    sku_sales = load_dataframes()['sales'][['Date', 'value', 'ts_id']].query('ts_id == @sku_code')
-    sku_sales['Date'] = pd.to_datetime(sku_sales['Date'])
-    sku_sales = sku_sales.set_index('Date')[['value']].reindex(all_months, fill_value=0)
+def get_all_months():
+    return pd.date_range('2021-01-01', '2026-04-01', freq="MS", name='date')
+    
+
+
+def get_bare_sku_df(sku_code, format=None, no_warnings=False, _sales=None):
+    """ return a dataframe with a dateTime index for our period of enquiry and the demand for our period of enquiry
+        zero values will be filled for any missing time periods
+
+        _sales: optionally pass a pre-loaded sales DataFrame to avoid repeated copying when
+                calling this function in a loop (load_dataframes() copies the full DataFrame
+                on every call, so passing it in pays that cost once instead of per-SKU)
+    """
+
+    all_months = get_all_months()
+
+    sales = _sales if _sales is not None else load_dataframes()['sales']
+
+    sku_sales = (
+        sales[['Date', 'value', 'ts_id']]
+        .query('ts_id == @sku_code')
+        .assign(Date=lambda df: pd.to_datetime(df['Date']))
+        .set_index('Date')[['value']]
+        .reindex(all_months, fill_value=0)
+        .rename(columns={'value': 'y'})
+    )
+
     if len(sku_sales) == 0:
         raise ValueError(f'SKU not found: {sku_code}')
-    missing_months = len(all_months) - len(sku_sales)
-    if missing_months > 0:
-        print(f"WARNING: {missing_months} months were missing data and defaulted to 0")
+
+    if not no_warnings:
+        missing_months = (sku_sales['y'] == 0).sum()
+        if missing_months > 0:
+            print(f"WARNING: {missing_months} months were missing data and defaulted to 0")
+
     return sku_sales
+
+
+get_bare_sku_df('015500620A000')
 
 
 def get_bodywork_skus():
     all_skus_flagged_as_bodywork = load_dataframes()["sales"].query('FAMILY_DESCRIPTION == "CARROCERIA"')['ts_id'].unique()
     return all_skus_flagged_as_bodywork
 
-    
+
+def rebuild_nixtla_df():
+    """ create a nixtla format dataframe for all relevant skus and save into the data directory
+    # this is the nixtla format needed for TimeGPT, TSB etc
+    # Column		NameData				TypeDescription
+    # unique_id		String or NumberA 		distinct identifier that distinguishes one individual time series from another (e.g., store ID, product code, or stock ticker)
+    # ds			Datestamp or Integer	The time index. Usually represented as dates in YYYY-MM-DD or YYYY-MM-DD HH:MM:SS format.
+    # y				Numeric					The actual historical or target value you want to forecast or analyze.
+    """
+
+    bodywork_skus = get_bodywork_skus()
+
+    # load once — avoids copying the full sales DataFrame once per SKU
+    sales = load_dataframes()['sales']
+
+    frames = []
+    for bodywork_sku in bodywork_skus:
+        temp_df = get_bare_sku_df(bodywork_sku, no_warnings=True, _sales=sales)
+        temp_df['unique_id'] = bodywork_sku
+        frames.append(temp_df)
+
+    nixtla = pd.concat(frames, sort=False)
+    nixtla.index = nixtla.index.rename('ds')
+
+    out_path = os.path.join(_resolve_data_path(), 'API_SOURCES', 'API_SOURCE_nixtla.parquet')
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    nixtla.to_parquet(out_path)
+
+    return nixtla
+
+
+def get_nixtla_df():
+    """Load the pre-built nixtla DataFrame from disk.
+
+    Run rebuild_nixtla_df() first to generate the file.
+    """
+    path = os.path.join(_resolve_data_path(), 'API_SOURCES', 'API_SOURCE_nixtla.parquet')
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"Nixtla parquet not found at {path}. Run rebuild_nixtla_df() to generate it."
+        )
+    return pd.read_parquet(path)

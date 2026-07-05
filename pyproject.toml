@@ -4,13 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "eptools"
-version = "0.1.17"
+version = "0.1.18"
 description = "Shared utilities for the Inchcape Suzuki employer project"
 requires-python = ">=3.9"
 dependencies = [
     "pandas",
     "numpy",
     "openpyxl",
+    "pyarrow",
 ]
 
 [tool.setuptools.packages.find]
