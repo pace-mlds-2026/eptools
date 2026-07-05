@@ -254,12 +254,14 @@ def rebuild_nixtla_df():
         temp_df['unique_id'] = bodywork_sku
         frames.append(temp_df)
 
+    # ds, y, unique_id must all be columns (not index) for the nixtla format
     nixtla = pd.concat(frames, sort=False)
-    nixtla = nixtla.rename({'date': 'ds'}) 
+    nixtla.index = nixtla.index.rename('ds')
+    nixtla = nixtla.reset_index()
 
     out_path = os.path.join(_resolve_data_path(), 'API_SOURCES', 'API_SOURCE_nixtla.parquet')
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    nixtla.to_parquet(out_path)
+    nixtla.to_parquet(out_path, index=False)
 
     return nixtla
 
