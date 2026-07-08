@@ -234,35 +234,81 @@ def get_bodywork_skus():
     return all_skus_flagged_as_bodywork
 
 
-def rebuild_nixtla_df():
-    """ create a nixtla format dataframe for all relevant skus and save into the data directory
-    # this is the nixtla format needed for TimeGPT, TSB etc
-    # Column		NameData				TypeDescription
-    # unique_id		String or NumberA 		distinct identifier that distinguishes one individual time series from another (e.g., store ID, product code, or stock ticker)
-    # ds			Datestamp or Integer	The time index. Usually represented as dates in YYYY-MM-DD or YYYY-MM-DD HH:MM:SS format.
-    # y				Numeric					The actual historical or target value you want to forecast or analyze.
+def get_modelling_skus(_sales=None):
+    """Single source of truth for the modelling SKU universe.
+
+    Edwin's scope (collision_demand_forecasting_edwin_v3, section 4): every SKU that is
+    *ever* labelled COLLISION, kept with its full history. The collision flag describes
+    what kind of part a SKU is, not what kind of transaction a row is, so a SKU only
+    labelled COLLISION from the Jan-2024 enrichment onwards still keeps its pre-2024
+    history. This replaces the old FAMILY_DESCRIPTION == "CARROCERIA" proxy, which happens
+    to select the same 8,097 SKUs today but is an incidental match, not the definition.
+
+    NOTE: the final modelling scope is still pending client confirmation. Change it here,
+    in this one place, rather than throughout the harness.
     """
+    sales = _sales if _sales is not None else load_dataframes()["sales"]
+    flag = sales["collision_flag"].astype(str).str.strip().str.upper()
+    is_collision = flag.str.contains("COLLISION") & ~flag.str.contains("NON")
+    ever = is_collision.groupby(sales["ts_id"].astype(str)).any()
+    return ever[ever].index.tolist()
 
-    bodywork_skus = get_bodywork_skus()
 
-    # load once — avoids copying the full sales DataFrame once per SKU
-    sales = load_dataframes()['sales']
 
-    frames = []
-    for bodywork_sku in bodywork_skus:
-        temp_df = get_bare_sku_df(bodywork_sku, no_warnings=True, _sales=sales)
-        temp_df['unique_id'] = bodywork_sku
-        frames.append(temp_df)
+def rebuild_nixtla_df():
+    """Build the nixtla-format frame (unique_id, ds, y) for the modelling SKU universe
+    and cache it to the DATA directory.
 
-    # ds, y, unique_id must all be columns (not index) for the nixtla format
-    nixtla = pd.concat(frames, sort=False)
-    nixtla.index = nixtla.index.rename('ds')
-    nixtla = nixtla.reset_index()
+    Scope: get_modelling_skus() — ever-COLLISION SKUs (Edwin's section 4).
 
-    out_path = os.path.join(_resolve_data_path(), 'API_SOURCES', 'API_SOURCE_nixtla.parquet')
+    Densification is *within each SKU's active window* only — from its first observed
+    month to its last — never across the global calendar. This is deliberate: it keeps
+    each SKU's real launch/discontinuation boundaries intact, so get_sku_active_windows
+    downstream recovers true first_seen/last_seen and the backtest's new-SKU exclusion
+    policy has something real to act on. A global zero-fill would make every SKU look
+    active from the dataset start and silently defeat that exclusion.
+
+    On the current data the within-window fill count is zero (the panel is already dense
+    inside each window), but the reindex + assertion stay as a guard for future refreshes.
+    """
+    sales = load_dataframes()["sales"]
+    skus = get_modelling_skus(_sales=sales)
+
+    sub = sales.loc[sales["ts_id"].astype(str).isin(skus), ["ts_id", "Date", "value"]].copy()
+    sub["unique_id"] = sub["ts_id"].astype(str)
+    sub["ds"] = pd.to_datetime(sub["Date"]).dt.to_period("M").dt.to_timestamp()
+    sub["y"] = pd.to_numeric(sub["value"], errors="coerce").fillna(0.0)
+
+    # collapse any accidental duplicate (unique_id, ds) rows defensively
+    observed = sub.groupby(["unique_id", "ds"], as_index=False)["y"].sum()
+
+    # within-window dense index: first..last observed month per SKU
+    bounds = observed.groupby("unique_id")["ds"].agg(first="min", last="max").reset_index()
+    full_index = pd.concat(
+        [pd.DataFrame({"unique_id": r.unique_id,
+                       "ds": pd.date_range(r.first, r.last, freq="MS")})
+         for r in bounds.itertuples()],
+        ignore_index=True,
+    )
+    nixtla = full_index.merge(observed, on=["unique_id", "ds"], how="left")
+    n_filled = int(nixtla["y"].isna().sum())
+    nixtla["y"] = nixtla["y"].fillna(0.0)
+
+    expected = int(((bounds["last"].dt.year - bounds["first"].dt.year) * 12
+                    + (bounds["last"].dt.month - bounds["first"].dt.month) + 1).sum())
+    assert len(nixtla) == expected, (
+        f"rebuild_nixtla_df row mismatch: expected {expected:,}, got {len(nixtla):,}"
+    )
+
+    nixtla = (nixtla[["unique_id", "ds", "y"]]
+              .sort_values(["unique_id", "ds"]).reset_index(drop=True))
+
+    out_path = os.path.join(_resolve_data_path(), "API_SOURCES", "API_SOURCE_nixtla.parquet")
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     nixtla.to_parquet(out_path, index=False)
 
+    print(f"rebuild_nixtla_df: {nixtla['unique_id'].nunique():,} SKUs, {len(nixtla):,} rows, "
+          f"filled {n_filled:,} within-window gaps.")
     return nixtla
 
 
@@ -277,6 +323,7 @@ def get_nixtla_df():
             f"Nixtla parquet not found at {path}. Run rebuild_nixtla_df() to generate it."
         )
     return pd.read_parquet(path)
+
 
 
 get_nixtla_df().columns
