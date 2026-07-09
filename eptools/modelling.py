@@ -516,44 +516,6 @@ def run_backtest(forecast_fn: ForecastFn,
     return pd.DataFrame(rows).sort_values("origin").reset_index(drop=True)
 
 
-#NOTEBOOK_ONLY
-#Edwin: Lets run a complete test for a naive forecasting function.
-collision_sales = get_collision_sales_df()
-windows = get_sku_active_windows(collision_sales)
-full_panel = build_full_panel(collision_sales, windows)
-
-
-
-#NOTEBOOK_ONLY
-naive_last_value_results = run_backtest(naive_last_value, full_panel, windows, min_train_months=12, verbose=True)
-print(f"folds: {len(naive_last_value_results)}")
-print(f"pooled WMAPE (all folds): {pooled_wmape(naive_last_value_results):.4f}")
-print("3-month rolling pooled WMAPE:")
-print(rolling_average_wmape(naive_last_value_results, window=3, method="pooled").round(4).to_list())
-
-
-#NOTEBOOK_ONLY
-#Edwin: Updated it to call the new function.
-naive_seasonal_results = run_backtest(naive_seasonal, full_panel, windows, min_train_months=12, verbose=True)
-
-print(f"folds: {len(naive_seasonal_results)}")
-print(f"pooled WMAPE (all folds): {pooled_wmape(naive_seasonal_results):.4f}")
-print("3-month rolling pooled WMAPE:")
-print(rolling_average_wmape(naive_seasonal_results, window=3, method="pooled").round(4).to_list())
-
-
-
-#NOTEBOOK_ONLY
-#Edwin: Updated it to call the new function.
-naive_moving_average_results = run_backtest(naive_moving_average, full_panel, windows, params={'window':3}, min_train_months=12, verbose=True)
-
-print(f"folds: {len(naive_moving_average_results)}")
-print(f"pooled WMAPE (all folds): {pooled_wmape(naive_moving_average_results):.4f}")
-print("3-month rolling pooled WMAPE:")
-print(rolling_average_wmape(naive_moving_average_results, window=3, method="pooled").round(4).to_list())
-
-
-
 def classify_sb(panel: pd.DataFrame) -> pd.DataFrame:
     """Syntetos-Boylan classification. Pass full_panel for a retrospective,
     reporting-only label. Pass train_frame(full_panel, origin) for a
@@ -614,19 +576,6 @@ def run_backtest_segmented(forecast_fn, full_panel, active_windows, sku_segment,
     return pd.concat(all_segs, ignore_index=True)
 
 
-#NOTEBOOK_ONLY
-sb_lookup = classify_sb(full_panel)  # retrospective, for reporting
-segmented = run_backtest_segmented(naive_moving_average, full_panel, windows, sb_lookup,
-                                    params={"window": 3}, min_train_months=12)
-
-pooled_wmape(segmented, by="sb_class")            # one number per segment, whole backtest
-
-
-
-#NOTEBOOK_ONLY
-!pip install statsforecast
-
-
 def to_nixtla_format(train_df):
     return train_df.rename(columns={"sku_id": "unique_id", "month": "ds", "demand": "y"})[
         ["unique_id", "ds", "y"]
@@ -652,55 +601,3 @@ def tsb_forecast_fn(train_df, horizon=18, alpha_d=0.2, alpha_p=0.2):
         + (out["month"].dt.month - origin.month)
     )
     return out[["sku_id", "month", "h", "y_pred"]]
-
-
-#NOTEBOOK_ONLY
-#Edwin: Updated it to call the new function.
-tsb_results = run_backtest(tsb_forecast_fn, full_panel, windows, min_train_months=12, verbose=True)
-
-print(f"folds: {len(tsb_results)}")
-print(f"pooled WMAPE (all folds): {pooled_wmape(tsb_results):.4f}")
-print("3-month rolling pooled WMAPE:")
-print(rolling_average_wmape(tsb_results, window=3, method="pooled").round(4).to_list())
-
-
-
-#NOTEBOOK_ONLY
-tsb_segmented = run_backtest_segmented(tsb_forecast_fn, full_panel, windows, sb_lookup, min_train_months=12)
-pooled_wmape(tsb_segmented, by="sb_class")            # one number per segment, whole backtest
-
-
-#NOTEBOOK_ONLY
-# Compare average forecast size vs average actual, TSB vs naive_moving_average,
-# restricted to Intermittent + Lumpy SKUs specifically
-intermittent_lumpy_skus = sb_lookup[sb_lookup["sb_class"].isin(["Intermittent", "Lumpy"])]["sku_id"]
-
-for name, results, fn, params in [
-    ("naive_moving_average", None, naive_moving_average, {"window": 3}),
-    ("tsb", None, tsb_forecast_fn, {}),
-]:
-    fold = next(expanding_window_folds(full_panel, windows, min_train_months=12))
-    preds = fn(fold["train_df"], horizon=len(fold["horizon_dates"]), **params)
-    target = preds[(preds["month"] == fold["target_date"]) & (preds["sku_id"].isin(intermittent_lumpy_skus))]
-    print(f"{name}: mean forecast on Intermittent+Lumpy = {target['y_pred'].mean():.3f}")
-
-actuals = fold["test_df"][fold["test_df"]["sku_id"].isin(intermittent_lumpy_skus)]
-print(f"actual mean demand on Intermittent+Lumpy this fold = {actuals['demand'].mean():.3f}")
-
-
-#NOTEBOOK_ONLY
-intermittent_lumpy_lookup = sb_lookup[sb_lookup["sb_class"].isin(["Intermittent", "Lumpy"])]
-
-def score_tsb_config(alpha_d, alpha_p):
-    results = run_backtest_segmented(
-        tsb_forecast_fn, full_panel, windows, intermittent_lumpy_lookup,
-        segment_col="sb_class", params={"alpha_d": alpha_d, "alpha_p": alpha_p},
-        min_train_months=12,
-    )
-    return pooled_wmape(results, by="sb_class")
-
-for alpha_d in [0.2, 0.3, 0.4]:
-    for alpha_p in [0.2, 0.4, 0.6, 0.8]:
-        print(f"alpha_d={alpha_d}, alpha_p={alpha_p}")
-        print(score_tsb_config(alpha_d, alpha_p))
-        print()
