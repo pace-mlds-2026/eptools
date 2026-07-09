@@ -3,7 +3,8 @@ import pandas as pd
 from eptools.data_preprocessing import _DATAFRAMES_CACHE, _resolve_data_path, _freeze
 
 
-def _load_source(relative_path, cache_key, date_format=None, data_path=None) -> pd.DataFrame:
+def _load_source(relative_path, cache_key, date_format=None, data_path=None,
+                 numeric_cols=None) -> pd.DataFrame:
     """
     Generic cached CSV loader for feature data sources.
 
@@ -17,6 +18,11 @@ def _load_source(relative_path, cache_key, date_format=None, data_path=None) -> 
         date_format:   Optional strptime format string passed to pd.to_datetime.
                        Omit for standard ISO / mixed date strings.
         data_path:     Optional override for the DATA directory.
+        numeric_cols:  Optional list of column names to coerce to numeric
+                       via pd.to_numeric(errors='coerce'). Use to clean
+                       stray non-numeric tokens (e.g. "ALL NaN") that would
+                       otherwise force a column to object dtype. Columns not
+                       listed (incl. categorical ones) are left untouched.
 
     Returns:
         DataFrame with a DatetimeIndex on the 'date' column.
@@ -28,6 +34,11 @@ def _load_source(relative_path, cache_key, date_format=None, data_path=None) -> 
     df = pd.read_csv(os.path.join(resolved, relative_path))
     df['date'] = pd.to_datetime(df['date'].astype(str), format=date_format)
     df = df.set_index('date')
+    # Coerce only the named columns, so a stray "ALL NaN" becomes real NaN
+    # instead of forcing the column to object dtype. Leaves everything else
+    # (incl. legitimately categorical columns) untouched.
+    if numeric_cols:
+        df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
     _DATAFRAMES_CACHE[key] = _freeze(df)
     return _DATAFRAMES_CACHE[key].copy()
 
