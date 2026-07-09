@@ -97,6 +97,7 @@ def get_macros(data_path=None) -> pd.DataFrame:
         "__macros__",
         date_format="%d/%m/%Y",
         data_path=data_path,
+        numeric_cols=["housing_index"]
     )
 
 
