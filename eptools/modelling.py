@@ -623,6 +623,7 @@ pooled_wmape(segmented, by="sb_class")            # one number per segment, whol
 
 
 
+#NOTEBOOK_ONLY
 !pip install statsforecast
 
 
@@ -669,6 +670,7 @@ tsb_segmented = run_backtest_segmented(tsb_forecast_fn, full_panel, windows, sb_
 pooled_wmape(tsb_segmented, by="sb_class")            # one number per segment, whole backtest
 
 
+#NOTEBOOK_ONLY
 # Compare average forecast size vs average actual, TSB vs naive_moving_average,
 # restricted to Intermittent + Lumpy SKUs specifically
 intermittent_lumpy_skus = sb_lookup[sb_lookup["sb_class"].isin(["Intermittent", "Lumpy"])]["sku_id"]
@@ -686,6 +688,7 @@ actuals = fold["test_df"][fold["test_df"]["sku_id"].isin(intermittent_lumpy_skus
 print(f"actual mean demand on Intermittent+Lumpy this fold = {actuals['demand'].mean():.3f}")
 
 
+#NOTEBOOK_ONLY
 intermittent_lumpy_lookup = sb_lookup[sb_lookup["sb_class"].isin(["Intermittent", "Lumpy"])]
 
 def score_tsb_config(alpha_d, alpha_p):
