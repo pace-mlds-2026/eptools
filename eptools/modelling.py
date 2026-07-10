@@ -956,9 +956,6 @@ def classify_sb(panel: pd.DataFrame) -> pd.DataFrame:
 #     return pd.concat(all_segs, ignore_index=True)
 
 
-pooled_wmape(tsb_results, by="sb_class")    
-
-
 # # NOTEBOOK_ONLY
 # tsb_segmented = run_backtest_segmented(tsb_forecast_fn, full_panel, windows, sb_lookup, min_train_months=12)
 # pooled_wmape(tsb_segmented, by="sb_class")            # one number per segment, whole backtest
