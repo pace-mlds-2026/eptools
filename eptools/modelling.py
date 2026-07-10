@@ -117,13 +117,6 @@ REDUNDANT_COLUMNS = [
     "REGION",
 ]
 
-REQUIRED_COLUMNS = [
-    "sku_id",   
-    "month",
-    "demand", 
-    "collision_flag"
-]
-
 
 def get_collision_sales_df():
     """
@@ -165,11 +158,8 @@ def get_collision_sales_df():
     collision_skus = sales.groupby("sku_id")["is_collision"].any()
     collision_skus = collision_skus[collision_skus].index
     sales = sales[sales["sku_id"].isin(collision_skus)]
-    
-    # drop all but the required columns i.e. ["sku_id", "month", "demand", "collision_flag"]
-    sales = sales[REQUIRED_COLUMNS]
 
-    return sales
+    return sales.drop(columns=["collision_flag_clean", "is_collision"])
 
 
 # get the dictionary and strip out the redundant column information
@@ -212,6 +202,19 @@ def build_full_panel(panel, active_windows):
     return full.sort_values(["sku_id", "month"]).reset_index(drop=True)
 
 
+def load_collision_backtest_data():
+    """One-call setup for the standard case. Equivalent to:
+        collision_sales = get_collision_sales_df()
+        windows = get_sku_active_windows(collision_sales)
+        full_panel = build_full_panel(collision_sales, windows)
+    Call those three directly if you need a custom scope (a SKU subset,
+    a different date range, a test panel)."""
+    collision_sales = get_collision_sales_df()
+    windows = get_sku_active_windows(collision_sales)
+    full_panel = build_full_panel(collision_sales, windows)
+    return full_panel, windows
+
+
 def get_moirai_wide_format_df():
 
     collision_sales = get_collision_sales_df()
@@ -242,50 +245,6 @@ def get_all_months():
 
 
 
-#Edwin: I think this can be remove as it isn't used anymore.
-def get_bare_sku_df(sku_code, format=None, no_warnings=False, _sales=None):
-    """ return a dataframe with a dateTime index spanning THIS SKU's own active
-        window (first sale to last sale), with the demand for that period.
-        zero values will be filled for any gap inside that window
-
-        _sales: optionally pass a pre-loaded sales DataFrame to avoid repeated copying when
-                calling this function in a loop (load_dataframes() copies the full DataFrame
-                on every call, so passing it in pays that cost once instead of per-SKU)
-    """
-
-    sales = _sales if _sales is not None else load_dataframes()['sales']
-
-    sku_rows = (
-        sales[['Date', 'value', 'ts_id']]
-        .query('ts_id == @sku_code')
-        .assign(Date=lambda df: pd.to_datetime(df['Date']))
-    )
-
-    if len(sku_rows) == 0:
-        raise ValueError(f'SKU not found: {sku_code}')
-
-    # reindex onto THIS SKU's own [first_seen, last_seen] window, not the
-    # global calendar -- reindexing to the full dataset range fabricates
-    # zero-demand rows before launch / after discontinuation, which biases
-    # training data and any classification (e.g. Syntetos-Boylan) computed
-    # from it.
-    sku_months = pd.date_range(sku_rows['Date'].min(), sku_rows['Date'].max(), freq="MS")
-
-    sku_sales = (
-        sku_rows
-        .set_index('Date')[['value']]
-        .reindex(sku_months, fill_value=0)
-        .rename(columns={'value': 'y'})
-    )
-
-    if not no_warnings:
-        missing_months = (sku_sales['y'] == 0).sum()
-        if missing_months > 0:
-            print(f"WARNING: {missing_months} months were missing data and defaulted to 0")
-
-    return sku_sales
-
-
 #Edwin: Rewritten to avoid a per-SKU query() loop to reduce conversion time. From 18 minutes to 19 seconds.
 def rebuild_nixtla_df():
     """ create a nixtla format dataframe for all relevant skus and save into the data directory
@@ -313,6 +272,27 @@ def rebuild_nixtla_df():
     nixtla.to_parquet(out_path, index=False)
 
     return nixtla
+
+
+def get_skus_by_segment(sku_segment: pd.DataFrame, segment_col: str, values) -> list:
+    """Return sku_ids matching one or more values in a segment column. Works
+    with ANY classification table -- sb_class, abc_class, subfamily, whatever
+    gets added later -- since it's parameterized on the column, not hardcoded
+    to Syntetos-Boylan specifically."""
+    if isinstance(values, str):
+        values = [values]
+    return sku_segment.loc[sku_segment[segment_col].isin(values), "sku_id"].tolist()
+
+
+def subset_panel(full_panel, active_windows, sku_ids):
+    """Restrict to a specific SKU subset, reusing the exact shape run_backtest
+    expects -- so the result plugs straight back in unchanged."""
+    return (full_panel[full_panel["sku_id"].isin(sku_ids)].reset_index(drop=True),
+            active_windows[active_windows["sku_id"].isin(sku_ids)].reset_index(drop=True))
+
+
+collision_sales = get_collision_sales_df()
+collision_sales.head()
 
 
 #Edwin: Moved here.
@@ -397,6 +377,31 @@ def expanding_window_folds(
                "test_df": test_df}
 
 
+def validate_forecast_fn(forecast_fn, **kwargs):
+    """Run forecast_fn against a tiny synthetic case and check the output
+    isn't obviously broken -- wrong columns, non-numeric, or a forecast
+    wildly out of scale (the exact TSB reset_index() bug). Call this once
+    on your own model before trusting a full backtest run."""
+    tiny_train = pd.DataFrame({
+        "sku_id": ["_TEST_A"]*4 + ["_TEST_B"]*4,
+        "month": list(pd.date_range("2021-01-01", periods=4, freq="MS"))*2,
+        "demand": [10.0, 12.0, 9.0, 11.0, 100.0, 120.0, 90.0, 110.0],
+    })
+    result = forecast_fn(tiny_train, horizon=2, **kwargs)
+    required = {"sku_id", "month", "y_pred"}
+    missing = required - set(result.columns)
+    if missing:
+        raise ValueError(f"missing required columns: {missing}")
+    if not pd.api.types.is_numeric_dtype(result["y_pred"]):
+        raise ValueError("y_pred is non-numeric")
+    max_actual = tiny_train["demand"].max()
+    if result["y_pred"].max() > max_actual * 50:
+        raise ValueError(f"y_pred max ({result['y_pred'].max():.1f}) is over 50x the largest "
+                         f"training value ({max_actual}) -- check for a stray index column "
+                         f"(see the TSB reset_index() bug).")
+    print("Looks fine.")
+
+
 def wmape(y_true: pd.Series, y_pred: pd.Series) -> float:
     """Weighted mean absolute percentage error: sum|error| / sum|actual|.
     Returns nan if actuals sum to zero, rather than dividing by zero."""
@@ -437,7 +442,22 @@ ForecastFn = Callable[..., pd.DataFrame]
     belongs inside whichever forecast_fn needs it, not as a harness default
     every model is forced through.
 """
-def _score_fold(fold: Dict[str, Any], preds: pd.DataFrame) -> Dict[str, Any]:
+def _joined_fold(fold, preds):
+    """The per-SKU joined table for one fold: sku_id, demand, y_pred, plus
+    which origin/target_date it came from. Excludes SKUs the model couldn't
+    forecast (see n_skus_excluded_new). Shared by _score_fold (which reduces
+    this to sums) and collect_predictions (which keeps it raw for plotting)."""
+    target_date = fold["target_date"]
+    target_preds = preds.loc[preds["month"] == target_date, ["sku_id", "y_pred"]].copy()
+    merged = fold["test_df"][["sku_id", "demand"]].merge(target_preds, on="sku_id", how="left")
+    missing_forecast = merged["y_pred"].isna()
+    n_skus_excluded_new = int(missing_forecast.sum())
+    merged = merged[~missing_forecast].copy()
+    merged["origin"] = fold["origin"]
+    merged["target_date"] = target_date
+    return merged, n_skus_excluded_new
+    
+def _score_fold(fold: Dict[str, Any], preds: pd.DataFrame):
     """Turn one fold's forecast into a row of atomic sums.
 
     fold["test_df"] is already restricted to SKUs active at target_date. A SKU
@@ -445,21 +465,13 @@ def _score_fold(fold: Dict[str, Any], preds: pd.DataFrame) -> Dict[str, Any]:
     the model had no history to forecast it from -- so it's excluded from
     WMAPE and counted in n_skus_excluded_new, never silently zero-filled.
     """
-    target_date = fold["target_date"]
-    target_preds = preds.loc[preds["month"] == target_date, ["sku_id", "y_pred"]].copy()
-
-    merged = fold["test_df"][["sku_id", "demand"]].merge(target_preds, on="sku_id", how="left")
-
-    missing_forecast = merged["y_pred"].isna()
-    n_skus_excluded_new = int(missing_forecast.sum())
-    merged = merged[~missing_forecast]
-
+    merged, n_skus_excluded_new = _joined_fold(fold, preds)
     err = merged["demand"] - merged["y_pred"]
     abs_actual_sum = float(merged["demand"].abs().sum())
 
     return {
         "origin": fold["origin"],
-        "target_date": target_date,
+        "target_date": fold["target_date"],
         "n_skus": int(len(merged)),
         "n_skus_excluded_new": n_skus_excluded_new,
         "abs_error_sum": float(err.abs().sum()),
@@ -476,6 +488,7 @@ def run_backtest(forecast_fn: ForecastFn,
                  params: Optional[Dict[str, Any]] = None, 
                  min_train_months: int = 12, 
                  on_fold_complete: Optional[Callable[[int, float], bool]] = None,
+                 collect_predictions=False,
                  verbose: bool = False,) -> pd.DataFrame:
     """Run the fixed rolling-origin backtest for one model configuration.
 
@@ -489,6 +502,12 @@ def run_backtest(forecast_fn: ForecastFn,
         Optuna pruning, a manual early-stop rule, or nothing at all hooks
         into per-fold progress -- this function never imports or references
         Optuna directly.
+    collect_predictions : bool, default False
+        If True, also returns a second DataFrame with every SKU-level
+        (actual, forecast) pair across the backtest -- for plotting one
+        SKU's history. Adds negligible cost (a merge already available from
+        the same forecast_fn call) since forecast_fn itself only runs once
+        per fold either way.
 
     Returns
     -------
@@ -498,6 +517,7 @@ def run_backtest(forecast_fn: ForecastFn,
     """
     params = params or {}
     rows = []
+    prediction_rows = [] if collect_predictions else None
     run_abs_err = 0.0
     run_abs_act = 0.0
 
@@ -508,6 +528,11 @@ def run_backtest(forecast_fn: ForecastFn,
         preds = forecast_fn(fold["train_df"], horizon=len(fold["horizon_dates"]), **params)
         row = _score_fold(fold, preds)
         rows.append(row)
+        
+        if collect_predictions:
+            merged, _ = _joined_fold(fold, preds)  # cheap: reuses the SAME preds, no re-fit
+            merged["abs_error"] = (merged["demand"] - merged["y_pred"]).abs()
+            prediction_rows.append(merged)
 
         run_abs_err += row["abs_error_sum"]
         run_abs_act += row["abs_actual_sum"]
@@ -522,8 +547,188 @@ def run_backtest(forecast_fn: ForecastFn,
             running_pooled = run_abs_err / run_abs_act if run_abs_act > 0 else float("nan")
             if on_fold_complete(fold_idx, running_pooled):
                 break
+    
+    results_df = pd.DataFrame(rows).sort_values("origin").reset_index(drop=True)
 
-    return pd.DataFrame(rows).sort_values("origin").reset_index(drop=True)
+    if collect_predictions:
+        predictions_df = (pd.concat(prediction_rows, ignore_index=True)
+                          .sort_values(["sku_id", "origin"]).reset_index(drop=True))
+        return results_df, predictions_df
+    return results_df
+
+
+def summarise_backtest(results_df, window=3, verbose=False):
+    """The standard headline numbers for any backtest run, so every model
+    comparison in this project reports the same things the same way."""
+    total_pooled = pooled_wmape(results_df)
+    rolling = rolling_average_wmape(results_df, window=window, method="pooled")
+    latest_rolling = rolling.iloc[-1]
+    latest_origins = results_df.sort_values("origin")["target_date"].iloc[-window:].dt.strftime("%Y-%m").tolist()
+
+    if verbose:
+        print(f"folds: {len(results_df)}")
+    print(f"total pooled WMAPE (whole backtest): {total_pooled:.4f}")
+    print(f"latest {window}-month rolling pooled WMAPE (covering {latest_origins}): {latest_rolling:.4f}")
+    if "n_skus_excluded_new" in results_df.columns and results_df["n_skus_excluded_new"].sum() > 0:
+        print(f"SKUs excluded (launched mid-lag-window): {results_df['n_skus_excluded_new'].sum()}")
+    return {"total_pooled": total_pooled, "latest_rolling": latest_rolling}
+
+
+def quick_backtest(forecast_fn, params=None, min_train_months=12, verbose=False):
+    """First-look convenience: load data, run, summarize, in one call.
+    For anything beyond a first look -- segmented results, a custom panel,
+    a hyperparameter sweep -- use run_backtest directly, since this wrapper
+    hides exactly the pieces you'd need to customize."""
+    full_panel, windows = load_collision_backtest_data()
+    results = run_backtest(forecast_fn, full_panel, windows, params=params,
+                            min_train_months=min_train_months, verbose=verbose)
+    summarise_backtest(results)
+    return results
+
+
+import matplotlib.pyplot as plt
+
+def plot_sku_forecast_history(predictions_df, sku_id, full_panel=None):
+    """Actual vs forecast at each fold's scored (lag) month, for one SKU,
+    across the whole backtest. If full_panel is given, plots the SKU's
+    complete demand history underneath for context.
+
+    predictions_df comes from run_backtest(..., collect_predictions=True).
+    """
+    d = predictions_df[predictions_df["sku_id"] == sku_id].sort_values("target_date")
+    fig, ax = plt.subplots(figsize=(11, 4))
+    if full_panel is not None:
+        hist = full_panel[full_panel["sku_id"] == sku_id]
+        ax.plot(hist["month"], hist["demand"], color="#ccc", linewidth=1, label="full demand history")
+    ax.plot(d["target_date"], d["demand"], marker="o", color="#2a78d6", label="actual (at scored month)")
+    ax.plot(d["target_date"], d["y_pred"], marker="s", linestyle="--", color="#e07b39", label="forecast")
+    ax.set_title(f"{sku_id}: forecast vs actual across the backtest")
+    ax.legend(fontsize=9)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_sku_horizon_snapshot(forecast_fn, full_panel, sku_id, origin, params=None, horizon=18):
+    """One origin's full forecast curve for one SKU, overlaid on its actual
+    history -- shows how the forecast degrades further from the origin,
+    which plot_sku_forecast_history doesn't (that one only shows the single
+    lag-scored point per fold, not the whole curve)."""
+    params = params or {}
+    tf = train_frame(full_panel, origin)
+    preds = forecast_fn(tf, horizon=horizon, **params)
+    preds_sku = preds[preds["sku_id"] == sku_id].sort_values("month")
+
+    fig, ax = plt.subplots(figsize=(11, 4))
+    hist = full_panel[(full_panel["sku_id"] == sku_id) & (full_panel["month"] <= origin)]
+    future = full_panel[(full_panel["sku_id"] == sku_id) & (full_panel["month"] > origin)]
+    ax.plot(hist["month"], hist["demand"], marker="o", color="#2a78d6", label="known history")
+    ax.plot(future["month"], future["demand"], marker="o", color="#2a78d6", alpha=0.3, label="actual (not yet known at origin)")
+    ax.plot(preds_sku["month"], preds_sku["y_pred"], marker="s", linestyle="--", color="#e07b39", label="forecast curve")
+    ax.axvline(origin, color="black", linestyle=":", label="origin")
+    ax.set_title(f"{sku_id}: full horizon forecast from origin={origin.date()}")
+    ax.legend(fontsize=8)
+    plt.tight_layout()
+    plt.show()
+
+
+def illustrate_folds(forecast_fn, full_panel, active_windows, sku_ids, origins,
+                      params=None, lag=LAG_MONTHS, horizon=6, show_computations=True,
+                      ylim=None, save_prefix=None):
+    """
+    Walk through a handful of specific origins, one plot per origin, showing
+    the named SKU(s)' known history, forecast curve, and the exact error at
+    the scored (lag) target month. This is the illustrative "here's how the
+    harness works, and how multiple SKUs pool into one WMAPE" view -- for
+    the full rolling series across every origin, use run_backtest directly.
+
+    Built on train_frame, active_skus_at, _joined_fold, _score_fold -- the
+    real harness pieces -- so this always reflects current behaviour
+    (exclude-and-count, native columns), not a separate reimplementation.
+
+    sku_ids : a single sku_id, or a list of 2-4 for a comparison view within
+        each fold (more than ~4 gets visually unreadable).
+    origins : specific origin months to illustrate, e.g.
+        ["2021-06-01", "2021-07-01", "2021-08-01", "2021-09-01"]
+    show_computations : if True (default), adds the right-hand text panel
+        with each SKU's actual/forecast/error and the fold's WMAPE. Set
+        False for a cleaner, presentation-only version of the same plot.
+    """
+    params = params or {}
+    if isinstance(sku_ids, str):
+        sku_ids = [sku_ids]
+
+    colors = ["#2a78d6", "#e07b39", "#4caf50", "#9c27b0"]
+    origins = sorted(pd.Timestamp(o) for o in origins)
+
+    if ylim is None:
+        relevant = full_panel[full_panel["sku_id"].isin(sku_ids)]["demand"]
+        ylim = (0, relevant.max() * 1.3)
+
+    for i, origin in enumerate(origins, start=1):
+        target_date = origin + pd.DateOffset(months=lag)
+        all_months = pd.date_range(full_panel["month"].min(), full_panel["month"].max(), freq="MS")
+        origin_idx = all_months.get_loc(origin)
+        horizon_end_idx = min(origin_idx + horizon, len(all_months) - 1)
+        horizon_dates = all_months[origin_idx + 1: horizon_end_idx + 1]
+
+        train_df = train_frame(full_panel, origin)
+        scored_skus = active_skus_at(active_windows, target_date)
+        test_df = full_panel.loc[
+            (full_panel["month"] == target_date) & (full_panel["sku_id"].isin(scored_skus))
+        ].copy()
+        fold = {"origin": origin, "target_date": target_date, "horizon_dates": horizon_dates,
+                "train_df": train_df, "test_df": test_df}
+
+        preds = forecast_fn(train_df, horizon=len(horizon_dates), **params)
+        row = _score_fold(fold, preds)
+        merged, _ = _joined_fold(fold, preds)
+
+        if show_computations:
+            fig, axes = plt.subplots(1, 2, figsize=(13, 4.3), gridspec_kw={"width_ratios": [2.3, 1]})
+            ax, ax2 = axes
+        else:
+            fig, ax = plt.subplots(figsize=(11, 4.3))
+
+        for sku, color in zip(sku_ids, colors):
+            hist = full_panel[(full_panel["sku_id"] == sku) & (full_panel["month"] <= origin)]
+            ax.plot(hist["month"], hist["demand"], marker="o", color=color, label=f"{sku} actual (known)")
+
+            fc_sku = preds[preds["sku_id"] == sku]
+            ax.plot(fc_sku["month"], fc_sku["y_pred"], marker="s", linestyle="--", color=color,
+                    alpha=0.6, label=f"{sku} forecast")
+
+            act_row = full_panel[(full_panel["sku_id"] == sku) & (full_panel["month"] == target_date)]
+            fc_row = fc_sku[fc_sku["month"] == target_date]
+            if len(act_row) and len(fc_row):
+                a, f = act_row["demand"].values[0], fc_row["y_pred"].values[0]
+                ax.plot([target_date, target_date], [a, f], color=color, linewidth=3, zorder=5)
+                ax.scatter([target_date], [a], color=color, s=70, zorder=6, edgecolor="black")
+                ax.scatter([target_date], [f], color=color, marker="s", s=70, zorder=6, edgecolor="black")
+                ax.annotate(f"|err|={abs(a-f):.2f}", (target_date, max(a, f) + ylim[1]*0.03),
+                            ha="center", fontsize=8, color=color)
+
+        ax.axvline(origin, color="black", linestyle=":", linewidth=1.2)
+        ax.axvline(target_date, color="gray", linestyle=":", linewidth=1.2)
+        ax.set_ylim(*ylim)
+        ax.set_title(f"Fold {i}: origin={origin.strftime('%b %Y')}  ->  scored at {target_date.strftime('%b %Y')}")
+        ax.legend(fontsize=7, loc="lower left")
+
+        if show_computations:
+            ax2.axis("off")
+            lines = [f"Target: {target_date.strftime('%b %Y')}", ""]
+            for r in merged[merged["sku_id"].isin(sku_ids)].itertuples():
+                lines.append(f"{r.sku_id}: actual={r.demand:.0f}  forecast={r.y_pred:.2f}  "
+                             f"|err|={abs(r.demand - r.y_pred):.2f}")
+            lines += ["", f"sum |errors| (all scored SKUs) = {row['abs_error_sum']:.3f}",
+                      f"sum |actuals| (all scored SKUs) = {row['abs_actual_sum']:.3f}", "",
+                      f"WMAPE = {row['wmape']:.4f}"]
+            ax2.text(0.02, 0.95, "\n".join(lines), va="top", fontsize=10.5, family="monospace")
+
+        plt.tight_layout()
+        if save_prefix:
+            plt.savefig(f"{save_prefix}_fold{i}_{origin.strftime('%b').lower()}.png", bbox_inches="tight")
+        plt.show()
+        print(f"  Fold {i}: origin={origin.date()}  target={target_date.date()}  WMAPE={row['wmape']:.4f}")
 
 
 def classify_sb(panel: pd.DataFrame) -> pd.DataFrame:
@@ -590,24 +795,3 @@ def to_nixtla_format(train_df):
     return train_df.rename(columns={"sku_id": "unique_id", "month": "ds", "demand": "y"})[
         ["unique_id", "ds", "y"]
     ]
-
-
-from statsforecast import StatsForecast
-from statsforecast.models import TSB
-
-def tsb_forecast_fn(train_df, horizon=18, alpha_d=0.2, alpha_p=0.2):
-    """TSB via statsforecast. Nixtla conversion happens here only --
-    the harness never sees unique_id/ds/y."""
-    nixtla_df = to_nixtla_format(train_df)
-    sf = StatsForecast(models=[TSB(alpha_d=alpha_d, alpha_p=alpha_p)], freq="MS")
-    raw = sf.forecast(df=nixtla_df, h=horizon)  # no reset_index() -- unique_id/ds are already columns
-
-    pred_col = [c for c in raw.columns if c not in ("unique_id", "ds")][0]
-    origin = train_df["month"].max()
-
-    out = raw.rename(columns={"unique_id": "sku_id", "ds": "month", pred_col: "y_pred"})
-    out["h"] = (
-        (out["month"].dt.year - origin.year) * 12
-        + (out["month"].dt.month - origin.month)
-    )
-    return out[["sku_id", "month", "h", "y_pred"]]

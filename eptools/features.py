@@ -43,6 +43,7 @@ def _load_source(relative_path, cache_key, date_format=None, data_path=None,
     return _DATAFRAMES_CACHE[key].copy()
 
 
+
 def get_suzuki_vehicle_sales_monthly_post_2014(data_path=None) -> pd.DataFrame:
     """Load ANAC Suzuki monthly vehicle sales data (2014+)."""
     return _load_source(
@@ -97,9 +98,8 @@ def get_macros(data_path=None) -> pd.DataFrame:
         "__macros__",
         date_format="%d/%m/%Y",
         data_path=data_path,
-        numeric_cols=["housing_index"]
+        numeric_cols=["housing_index"],
     )
-
 
 def get_suzuki_claims(data_path=None) -> pd.DataFrame:
     """Load monthly Suzuki insurance claims data (2020–2024)."""
