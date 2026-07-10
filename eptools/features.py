@@ -53,16 +53,6 @@ def get_suzuki_vehicle_sales_monthly_post_2014(data_path=None) -> pd.DataFrame:
     )
 
 
-def get_suzuki_vehicle_sales_annual_2008_2013(data_path=None) -> pd.DataFrame:
-    """Load ANAC Suzuki annual vehicle sales data (2008–2013)."""
-    return _load_source(
-        "API_SOURCES/API_SOURCE_vehicle_sales_annual_2008_2013.csv",
-        "__anac_vehicle_sales_annual_2008_2013__",
-        date_format="%Y",
-        data_path=data_path,
-    )
-
-
 def get_weather(data_path=None) -> pd.DataFrame:
     """Load central Santiago weather data."""
     return _load_source(
@@ -122,7 +112,6 @@ def get_suzuki_fleet_size(data_path=None) -> pd.DataFrame:
 _SOURCES = {
     "macros": get_macros,
     "suzuki_vehicle_sales_monthly_post_2014": get_suzuki_vehicle_sales_monthly_post_2014,
-    "suzuki_vehicle_sales_annual_2008_2013": get_suzuki_vehicle_sales_annual_2008_2013,
     "weather": get_weather,
     "daylight": get_daylight,
     "parc_allbrands": get_parc_allbrands,
