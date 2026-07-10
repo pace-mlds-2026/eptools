@@ -282,6 +282,12 @@ def rebuild_nixtla_df():
     return nixtla
 
 
+def to_nixtla_format(train_df):
+    return train_df.rename(columns={"sku_id": "unique_id", "month": "ds", "demand": "y"})[
+        ["unique_id", "ds", "y"]
+    ]
+
+
 def get_skus_by_segment(sku_segment: pd.DataFrame, segment_col: str, values) -> list:
     """Return sku_ids matching one or more values in a segment column. Works
     with ANY classification table -- sb_class, abc_class, subfamily, whatever
@@ -595,23 +601,97 @@ def quick_backtest(forecast_fn, params=None, min_train_months=12, verbose=False)
 
 
 import matplotlib.pyplot as plt
-
-def plot_sku_forecast_history(predictions_df, sku_id, full_panel=None):
-    """Actual vs forecast at each fold's scored (lag) month, for one SKU,
-    across the whole backtest. If full_panel is given, plots the SKU's
-    complete demand history underneath for context.
-
-    predictions_df comes from run_backtest(..., collect_predictions=True).
-    """
+def plot_sku_forecast_history(predictions_df, sku_id, full_panel=None, ax=None):
+    """... same docstring, plus:
+    ax : optional matplotlib Axes to draw into (e.g. one cell of a grid).
+    If None (default), creates and shows its own figure -- unchanged
+    standalone behaviour."""
     d = predictions_df[predictions_df["sku_id"] == sku_id].sort_values("target_date")
-    fig, ax = plt.subplots(figsize=(11, 4))
+    standalone = ax is None
+    if standalone:
+        fig, ax = plt.subplots(figsize=(9, 3.3))
     if full_panel is not None:
         hist = full_panel[full_panel["sku_id"] == sku_id]
-        ax.plot(hist["month"], hist["demand"], color="#ccc", linewidth=1, label="full demand history")
-    ax.plot(d["target_date"], d["demand"], marker="o", color="#2a78d6", label="actual (at scored month)")
-    ax.plot(d["target_date"], d["y_pred"], marker="s", linestyle="--", color="#e07b39", label="forecast")
-    ax.set_title(f"{sku_id}: forecast vs actual across the backtest")
-    ax.legend(fontsize=9)
+        ax.plot(hist["month"], hist["demand"], color="#ccc", linewidth=1, label="full history")
+    ax.plot(d["target_date"], d["demand"], marker="o", color="#2a78d6", label="actual", markersize=4)
+    ax.plot(d["target_date"], d["y_pred"], marker="s", linestyle="--", color="#e07b39", label="forecast", markersize=4)
+    ax.set_title(sku_id, fontsize=9)
+    ax.legend(fontsize=7)
+    ax.tick_params(labelsize=7)
+    if standalone:
+        plt.tight_layout()
+        plt.show()
+        
+def pick_example_skus(full_panel, sku_segment=None, segment_col="sb_class", n_per_group=1, how="median"):
+    """Pick representative example SKUs, one or more per group. If sku_segment
+    is given, groups by that classification. If not, falls back to volume
+    terciles computed directly from full_panel -- a sensible default on its
+    own, since volume tier is the same commercial-priority axis as ABC tier,
+    and needs no classification step to compute.
+
+    how: "median" picks the SKU closest to the group's median volume (a
+    typical example); "max" picks the highest-volume SKU (a flagship example)."""
+    total_demand = full_panel.groupby("sku_id")["demand"].sum().rename("total_demand").reset_index()
+    if sku_segment is not None:
+        grouped = total_demand.merge(sku_segment[["sku_id", segment_col]], on="sku_id", how="left")
+        group_col = segment_col
+    else:
+        grouped = total_demand.copy()
+        grouped["volume_tier"] = pd.qcut(grouped["total_demand"].rank(method="first"),
+                                          q=3, labels=["Low", "Medium", "High"])
+        group_col = "volume_tier"
+
+    examples = {}
+    for group, g in grouped.groupby(group_col, observed=True):
+        if len(g) == 0:
+            continue
+        if how == "median":
+            target = g["total_demand"].median()
+            pick = g.iloc[(g["total_demand"] - target).abs().argsort()[:n_per_group]]
+        else:
+            pick = g.nlargest(n_per_group, "total_demand")
+        examples[group] = pick["sku_id"].tolist()
+    return examples
+
+
+def plot_example_skus(predictions_df, full_panel, sku_segment=None, segment_col="sb_class",
+                       n_per_group=1, how="median"):
+    """Plot plot_sku_forecast_history for a representative SKU per group --
+    S-B class if sku_segment is given, volume tier otherwise. No changes
+    needed to plot_sku_forecast_history itself."""
+    examples = pick_example_skus(full_panel, sku_segment, segment_col, n_per_group, how)
+    for group, sku_ids in examples.items():
+        for sku_id in sku_ids:
+            print(f"--- {group}: {sku_id} ---")
+            plot_sku_forecast_history(predictions_df, sku_id, full_panel=full_panel)
+            
+def plot_example_skus_grid(predictions_df, full_panel, sku_segment=None, segment_col="sb_class",
+                            n_per_group=2, how="median", figsize_per_cell=(4.2, 2.8)):
+    """
+    Grid version of plot_example_skus: one row per group (S-B class, or
+    volume tier if sku_segment is None), up to n_per_group columns, all in
+    one figure. If a group has fewer than n_per_group SKUs, the remaining
+    cells in that row are left blank rather than erroring.
+    """
+    examples = pick_example_skus(full_panel, sku_segment, segment_col, n_per_group, how)
+    groups = list(examples.keys())
+    n_rows = len(groups)
+    n_cols = max(len(v) for v in examples.values())
+
+    fig, axes = plt.subplots(n_rows, n_cols,
+                              figsize=(figsize_per_cell[0]*n_cols, figsize_per_cell[1]*n_rows),
+                              squeeze=False)
+
+    for row_i, group in enumerate(groups):
+        sku_ids = examples[group]
+        for col_i in range(n_cols):
+            ax = axes[row_i][col_i]
+            if col_i < len(sku_ids):
+                plot_sku_forecast_history(predictions_df, sku_ids[col_i], full_panel=full_panel, ax=ax)
+            else:
+                ax.axis("off")
+        axes[row_i][0].set_ylabel(str(group), fontsize=10, fontweight="bold")
+
     plt.tight_layout()
     plt.show()
 
@@ -797,9 +877,3 @@ def run_backtest_segmented(forecast_fn, full_panel, active_windows, sku_segment,
         preds = forecast_fn(fold["train_df"], horizon=len(fold["horizon_dates"]), **params)
         all_segs.append(_score_fold_segments(fold, preds, sku_segment, segment_col=segment_col))
     return pd.concat(all_segs, ignore_index=True)
-
-
-def to_nixtla_format(train_df):
-    return train_df.rename(columns={"sku_id": "unique_id", "month": "ds", "demand": "y"})[
-        ["unique_id", "ds", "y"]
-    ]
