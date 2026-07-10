@@ -124,7 +124,6 @@ REQUIRED_COLUMNS = [
     "collision_flag"
 ]
 
-
 def get_collision_sales_df():
     """
     Load and clean the sales data, returning only collision rows.
@@ -331,7 +330,6 @@ def active_skus_at(active_windows: pd.DataFrame, target_month: pd.Timestamp) -> 
     )
     return set(active_windows.loc[mask, "sku_id"])
 
-
 #Edwin: reworked from previous work.
 def train_frame(full_panel: pd.DataFrame, origin: pd.Timestamp, window_months: int | None = None) -> pd.DataFrame:
     """
@@ -422,7 +420,6 @@ def wmape(y_true: pd.Series, y_pred: pd.Series) -> float:
     denom = float(np.sum(np.abs(y_true)))
     return float(np.sum(np.abs(y_true - y_pred)) / denom) if denom > 0 else float("nan")
 
-
 def pooled_wmape(results_df: pd.DataFrame, by: Optional[list] = None):
     """Volume-weighted pooled WMAPE from atomic sums.
 
@@ -437,7 +434,6 @@ def pooled_wmape(results_df: pd.DataFrame, by: Optional[list] = None):
     g = results_df.groupby(by)
     out = (g["abs_error_sum"].sum() / g["abs_actual_sum"].sum()).rename("pooled_wmape")
     return out.reset_index()
-
 
 def rolling_average_wmape(results_df, window=3, method="pooled"):
     r = results_df.sort_values("origin").reset_index(drop=True)
@@ -493,80 +489,165 @@ def _score_fold(fold: Dict[str, Any], preds: pd.DataFrame):
         "error_sum": float(err.sum()),
         "wmape": wmape(merged["demand"], merged["y_pred"]),
     }
+    
+def _score_fold_segments(fold, preds, sku_segment, segment_col="sb_class"):
+    """Same join as _score_fold, grouped by segment_col before summing.
+    Tracks n_skus_excluded_new PER SEGMENT, since exclusion rates can differ
+    meaningfully by segment."""
+    target_date = fold["target_date"]
+    target_preds = preds.loc[preds["month"] == target_date, ["sku_id", "y_pred"]].copy()
+
+    merged = (fold["test_df"][["sku_id", "demand"]]
+              .merge(target_preds, on="sku_id", how="left")
+              .merge(sku_segment[["sku_id", segment_col]], on="sku_id", how="left"))
+
+    missing_forecast = merged["y_pred"].isna()
+    excluded_counts = merged.loc[missing_forecast].groupby(segment_col).size().rename("n_skus_excluded_new")
+
+    merged = merged[~missing_forecast].copy()
+    merged["abs_error"] = (merged["demand"] - merged["y_pred"]).abs()
+
+    out = merged.groupby(segment_col).agg(
+        abs_error_sum=("abs_error", "sum"),
+        abs_actual_sum=("demand", lambda s: s.abs().sum()),
+        n_skus=("sku_id", "count"),
+    ).reset_index()
+    out = out.merge(excluded_counts, on=segment_col, how="left")
+    out["n_skus_excluded_new"] = out["n_skus_excluded_new"].fillna(0).astype(int)
+    out["origin"] = fold["origin"]
+    out["target_date"] = target_date
+    return out
 
 
-#Edwin: a newer and cleaner version.
-def run_backtest(forecast_fn: ForecastFn, 
-                 full_panel: pd.DataFrame, 
-                 active_windows: pd.DataFrame,
-                 params: Optional[Dict[str, Any]] = None, 
-                 min_train_months: int = 12, 
-                 on_fold_complete: Optional[Callable[[int, float], bool]] = None,
-                 collect_predictions=False,
-                 verbose: bool = False,) -> pd.DataFrame:
-    """Run the fixed rolling-origin backtest for one model configuration.
+# #Edwin: a newer and cleaner version.
+# def run_backtest(forecast_fn: ForecastFn, 
+#                  full_panel: pd.DataFrame, 
+#                  active_windows: pd.DataFrame,
+#                  params: Optional[Dict[str, Any]] = None, 
+#                  min_train_months: int = 12, 
+#                  on_fold_complete: Optional[Callable[[int, float], bool]] = None,
+#                  collect_predictions=False,
+#                  verbose: bool = False,) -> pd.DataFrame:
+#     """Run the fixed rolling-origin backtest for one model configuration.
 
-    forecast_fn : forecast_fn(train_df, horizon=len(horizon_dates), **params)
-    full_panel, active_windows : the corrected panel and SKU windows, e.g.
-        from get_collision_sales_df() -> get_sku_active_windows() -> build_full_panel().
-    min_train_months : warm-up history before the first origin. Keep identical
-        across models being compared.
-    on_fold_complete : callable(fold_idx, running_pooled_wmape) -> bool, optional.
-        Called after every fold. Return True to stop early. This is how
-        Optuna pruning, a manual early-stop rule, or nothing at all hooks
-        into per-fold progress -- this function never imports or references
-        Optuna directly.
-    collect_predictions : bool, default False
-        If True, also returns a second DataFrame with every SKU-level
-        (actual, forecast) pair across the backtest -- for plotting one
-        SKU's history. Adds negligible cost (a merge already available from
-        the same forecast_fn call) since forecast_fn itself only runs once
-        per fold either way.
+#     forecast_fn : forecast_fn(train_df, horizon=len(horizon_dates), **params)
+#     full_panel, active_windows : the corrected panel and SKU windows, e.g.
+#         from get_collision_sales_df() -> get_sku_active_windows() -> build_full_panel().
+#     min_train_months : warm-up history before the first origin. Keep identical
+#         across models being compared.
+#     on_fold_complete : callable(fold_idx, running_pooled_wmape) -> bool, optional.
+#         Called after every fold. Return True to stop early. This is how
+#         Optuna pruning, a manual early-stop rule, or nothing at all hooks
+#         into per-fold progress -- this function never imports or references
+#         Optuna directly.
+#     collect_predictions : bool, default False
+#         If True, also returns a second DataFrame with every SKU-level
+#         (actual, forecast) pair across the backtest -- for plotting one
+#         SKU's history. Adds negligible cost (a merge already available from
+#         the same forecast_fn call) since forecast_fn itself only runs once
+#         per fold either way.
 
-    Returns
-    -------
-    pd.DataFrame
-        One row per fold: origin, target_date, n_skus, abs_error_sum,
-        abs_actual_sum, error_sum, wmape. Sorted by origin.
+#     Returns
+#     -------
+#     pd.DataFrame
+#         One row per fold: origin, target_date, n_skus, abs_error_sum,
+#         abs_actual_sum, error_sum, wmape. Sorted by origin.
+#     """
+#     params = params or {}
+#     rows = []
+#     prediction_rows = [] if collect_predictions else None
+#     run_abs_err = 0.0
+#     run_abs_act = 0.0
+
+#     fold_iter = enumerate(expanding_window_folds(
+#         full_panel, active_windows, min_train_months=min_train_months
+#     ))
+#     for fold_idx, fold in fold_iter:
+#         preds = forecast_fn(fold["train_df"], horizon=len(fold["horizon_dates"]), **params)
+#         row = _score_fold(fold, preds)
+#         rows.append(row)
+        
+#         if collect_predictions:
+#             merged, _ = _joined_fold(fold, preds)  # cheap: reuses the SAME preds, no re-fit
+#             merged["abs_error"] = (merged["demand"] - merged["y_pred"]).abs()
+#             prediction_rows.append(merged)
+
+#         run_abs_err += row["abs_error_sum"]
+#         run_abs_act += row["abs_actual_sum"]
+
+#         if verbose:
+#             print(
+#                 f"fold {fold_idx + 1:>2}  origin={row['origin']:%Y-%m}  "
+#                 f"target={row['target_date']:%Y-%m}  wmape={row['wmape']:.4f}"
+#             )
+
+#         if on_fold_complete is not None:
+#             running_pooled = run_abs_err / run_abs_act if run_abs_act > 0 else float("nan")
+#             if on_fold_complete(fold_idx, running_pooled):
+#                 break
+    
+#     results_df = pd.DataFrame(rows).sort_values("origin").reset_index(drop=True)
+
+#     if collect_predictions:
+#         predictions_df = (pd.concat(prediction_rows, ignore_index=True)
+#                           .sort_values(["sku_id", "origin"]).reset_index(drop=True))
+#         return results_df, predictions_df
+#     return results_df
+
+
+#Edwin: 10th July - merged segmentation into run_backtest
+def run_backtest(forecast_fn, full_panel, 
+                active_windows, params=None, min_train_months=12,
+                on_fold_complete=None, collect_predictions=False, verbose=False,
+                sku_segment=None, segment_col="sb_class"):
+    """
+    If sku_segment is None (default): one row per fold, pooled across all
+    scored SKUs -- exactly what this function always returned.
+
+    If sku_segment is given: one row per (fold, segment) instead. Calling
+    pooled_wmape(results) with no `by` still gives the correct overall
+    pooled number in this case, since segments are disjoint and their sums
+    reconstruct the total exactly (see the share-weighted identity). There
+    is deliberately no separate 'ALL' row mixed in alongside the segment
+    rows -- that would double-count every SKU-month's error.
     """
     params = params or {}
     rows = []
     prediction_rows = [] if collect_predictions else None
-    run_abs_err = 0.0
-    run_abs_act = 0.0
+    run_abs_err = run_abs_act = 0.0
 
-    fold_iter = enumerate(expanding_window_folds(
-        full_panel, active_windows, min_train_months=min_train_months
-    ))
-    for fold_idx, fold in fold_iter:
+    for fold_idx, fold in enumerate(expanding_window_folds(full_panel, active_windows, min_train_months=min_train_months)):
         preds = forecast_fn(fold["train_df"], horizon=len(fold["horizon_dates"]), **params)
-        row = _score_fold(fold, preds)
-        rows.append(row)
-        
+
+        if sku_segment is None:
+            row = _score_fold(fold, preds)
+            rows.append(row)
+            fold_abs_err, fold_abs_act = row["abs_error_sum"], row["abs_actual_sum"]
+        else:
+            seg_df = _score_fold_segments(fold, preds, sku_segment, segment_col=segment_col)
+            rows.extend(seg_df.to_dict("records"))
+            fold_abs_err, fold_abs_act = seg_df["abs_error_sum"].sum(), seg_df["abs_actual_sum"].sum()
+
         if collect_predictions:
-            merged, _ = _joined_fold(fold, preds)  # cheap: reuses the SAME preds, no re-fit
+            merged, _ = _joined_fold(fold, preds)
             merged["abs_error"] = (merged["demand"] - merged["y_pred"]).abs()
+            if sku_segment is not None:
+                merged = merged.merge(sku_segment, on="sku_id", how="left")
             prediction_rows.append(merged)
 
-        run_abs_err += row["abs_error_sum"]
-        run_abs_act += row["abs_actual_sum"]
-
+        run_abs_err += fold_abs_err
+        run_abs_act += fold_abs_act
         if verbose:
-            print(
-                f"fold {fold_idx + 1:>2}  origin={row['origin']:%Y-%m}  "
-                f"target={row['target_date']:%Y-%m}  wmape={row['wmape']:.4f}"
-            )
-
+            wmape_this_fold = fold_abs_err / fold_abs_act if fold_abs_act > 0 else float("nan")
+            print(f"fold {fold_idx+1:>2}  origin={fold['origin']:%Y-%m}  target={fold['target_date']:%Y-%m}  wmape={wmape_this_fold:.4f}")
         if on_fold_complete is not None:
             running_pooled = run_abs_err / run_abs_act if run_abs_act > 0 else float("nan")
             if on_fold_complete(fold_idx, running_pooled):
                 break
-    
-    results_df = pd.DataFrame(rows).sort_values("origin").reset_index(drop=True)
 
+    results_df = pd.DataFrame(rows).sort_values("origin").reset_index(drop=True)
     if collect_predictions:
-        predictions_df = (pd.concat(prediction_rows, ignore_index=True)
-                          .sort_values(["sku_id", "origin"]).reset_index(drop=True))
+        predictions_df = pd.concat(prediction_rows, ignore_index=True).sort_values(["sku_id","origin"]).reset_index(drop=True)
         return results_df, predictions_df
     return results_df
 
@@ -729,10 +810,6 @@ def illustrate_folds(forecast_fn, full_panel, active_windows, sku_ids, origins,
     harness works, and how multiple SKUs pool into one WMAPE" view -- for
     the full rolling series across every origin, use run_backtest directly.
 
-    Built on train_frame, active_skus_at, _joined_fold, _score_fold -- the
-    real harness pieces -- so this always reflects current behaviour
-    (exclude-and-count, native columns), not a separate reimplementation.
-
     sku_ids : a single sku_id, or a list of 2-4 for a comparison view within
         each fold (more than ~4 gets visually unreadable).
     origins : specific origin months to illustrate, e.g.
@@ -848,32 +925,40 @@ def classify_sb(panel: pd.DataFrame) -> pd.DataFrame:
     return stats[["sku_id", "adi", "cv2", "sb_class"]]
 
 
-def _score_fold_segments(fold, preds, sku_segment: pd.DataFrame, segment_col: str = "sb_class") -> pd.DataFrame:
-    """Same as _score_fold, but returns one row PER SEGMENT per fold instead
-    of one row for the whole fold. sku_segment: DataFrame[sku_id, segment_col]."""
-    target_date = fold["target_date"]
-    target_preds = preds.loc[preds["month"] == target_date, ["sku_id", "y_pred"]].copy()
+# def _score_fold_segments(fold, preds, sku_segment: pd.DataFrame, segment_col: str = "sb_class") -> pd.DataFrame:
+#     """Same as _score_fold, but returns one row PER SEGMENT per fold instead
+#     of one row for the whole fold. sku_segment: DataFrame[sku_id, segment_col]."""
+#     target_date = fold["target_date"]
+#     target_preds = preds.loc[preds["month"] == target_date, ["sku_id", "y_pred"]].copy()
 
-    merged = fold["test_df"][["sku_id", "demand"]].merge(target_preds, on="sku_id", how="left")
-    missing_forecast = merged["y_pred"].isna()
-    merged = merged[~missing_forecast].merge(sku_segment, on="sku_id", how="left")
-    merged["abs_error"] = (merged["demand"] - merged["y_pred"]).abs()
+#     merged = fold["test_df"][["sku_id", "demand"]].merge(target_preds, on="sku_id", how="left")
+#     missing_forecast = merged["y_pred"].isna()
+#     merged = merged[~missing_forecast].merge(sku_segment, on="sku_id", how="left")
+#     merged["abs_error"] = (merged["demand"] - merged["y_pred"]).abs()
 
-    out = merged.groupby(segment_col).agg(
-        abs_error_sum=("abs_error", "sum"),
-        abs_actual_sum=("demand", lambda s: s.abs().sum()),
-        n_skus=("sku_id", "count"),
-    ).reset_index()
-    out["origin"], out["target_date"] = fold["origin"], target_date
-    return out
+#     out = merged.groupby(segment_col).agg(
+#         abs_error_sum=("abs_error", "sum"),
+#         abs_actual_sum=("demand", lambda s: s.abs().sum()),
+#         n_skus=("sku_id", "count"),
+#     ).reset_index()
+#     out["origin"], out["target_date"] = fold["origin"], target_date
+#     return out
 
 
-def run_backtest_segmented(forecast_fn, full_panel, active_windows, sku_segment,
-                          segment_col="sb_class", params=None, min_train_months=12) -> pd.DataFrame:
-    """Same fold generator as run_backtest, reused unchanged -- only scoring differs."""
-    params = params or {}
-    all_segs = []
-    for fold in expanding_window_folds(full_panel, active_windows, min_train_months=min_train_months):
-        preds = forecast_fn(fold["train_df"], horizon=len(fold["horizon_dates"]), **params)
-        all_segs.append(_score_fold_segments(fold, preds, sku_segment, segment_col=segment_col))
-    return pd.concat(all_segs, ignore_index=True)
+# def run_backtest_segmented(forecast_fn, full_panel, active_windows, sku_segment,
+#                           segment_col="sb_class", params=None, min_train_months=12) -> pd.DataFrame:
+#     """Same fold generator as run_backtest, reused unchanged -- only scoring differs."""
+#     params = params or {}
+#     all_segs = []
+#     for fold in expanding_window_folds(full_panel, active_windows, min_train_months=min_train_months):
+#         preds = forecast_fn(fold["train_df"], horizon=len(fold["horizon_dates"]), **params)
+#         all_segs.append(_score_fold_segments(fold, preds, sku_segment, segment_col=segment_col))
+#     return pd.concat(all_segs, ignore_index=True)
+
+
+pooled_wmape(tsb_segmented, by="sb_class")    
+
+
+# # NOTEBOOK_ONLY
+# tsb_segmented = run_backtest_segmented(tsb_forecast_fn, full_panel, windows, sb_lookup, min_train_months=12)
+# pooled_wmape(tsb_segmented, by="sb_class")            # one number per segment, whole backtest
