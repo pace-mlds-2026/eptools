@@ -956,7 +956,7 @@ def classify_sb(panel: pd.DataFrame) -> pd.DataFrame:
 #     return pd.concat(all_segs, ignore_index=True)
 
 
-pooled_wmape(tsb_segmented, by="sb_class")    
+pooled_wmape(tsb_results, by="sb_class")    
 
 
 # # NOTEBOOK_ONLY
