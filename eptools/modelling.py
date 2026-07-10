@@ -117,6 +117,13 @@ REDUNDANT_COLUMNS = [
     "REGION",
 ]
 
+REQUIRED_COLUMNS = [
+    "sku_id",   
+    "month",
+    "demand", 
+    "collision_flag"
+]
+
 
 def get_collision_sales_df():
     """
@@ -158,8 +165,10 @@ def get_collision_sales_df():
     collision_skus = sales.groupby("sku_id")["is_collision"].any()
     collision_skus = collision_skus[collision_skus].index
     sales = sales[sales["sku_id"].isin(collision_skus)]
-
-    return sales.drop(columns=["collision_flag_clean", "is_collision"])
+    
+    # drop all but the required columns i.e. ["sku_id", "month", "demand", "collision_flag"]
+    sales = sales[REQUIRED_COLUMNS]
+    return sales
 
 
 # get the dictionary and strip out the redundant column information
@@ -167,7 +176,6 @@ def get_collision_sales_dictionary():
     dfs = load_dataframes()
     dictionary = dfs['dictionary']
     return dictionary[~dictionary["column_name"].isin(REDUNDANT_COLUMNS)]
-
 
 
 #Edwin: Newly added functions for correctly getting the right data slices.
