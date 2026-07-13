@@ -44,6 +44,37 @@ def _load_source(relative_path, cache_key, date_format=None, data_path=None,
 
 
 
+def _load_source_by_id(relative_path, cache_key, id_col, data_path=None) -> pd.DataFrame:
+    """
+    Generic cached CSV loader for feature data sources keyed by an id column
+    (e.g. sku_id / unique_id) rather than a date.
+
+    Resolves the data path, checks the in-memory cache, reads the CSV, sets
+    `id_col` as the index (cast to str so it lines up with the 'sku_id'
+    column produced by get_collision_sales_df()), freezes the result, and
+    returns a mutable copy.
+
+    Args:
+        relative_path: Path to the CSV relative to the resolved DATA directory.
+        cache_key:     Unique string used as the in-memory cache key.
+        id_col:        Column name to use as the index (e.g. 'unique_id').
+        data_path:     Optional override for the DATA directory.
+
+    Returns:
+        DataFrame indexed by `id_col`.
+    """
+    resolved = _resolve_data_path(data_path)
+    key = resolved + cache_key
+    if key in _DATAFRAMES_CACHE:
+        return _DATAFRAMES_CACHE[key].copy()
+    df = pd.read_csv(os.path.join(resolved, relative_path))
+    df[id_col] = df[id_col].astype(str)
+    df = df.set_index(id_col)
+    _DATAFRAMES_CACHE[key] = _freeze(df)
+    return _DATAFRAMES_CACHE[key].copy()
+
+
+
 def get_suzuki_vehicle_sales_monthly_post_2014(data_path=None) -> pd.DataFrame:
     """Load ANAC Suzuki monthly vehicle sales data (2014+)."""
     return _load_source(
@@ -109,6 +140,35 @@ def get_suzuki_fleet_size(data_path=None) -> pd.DataFrame:
     )
 
 
+def get_sb_class(data_path=None) -> pd.DataFrame:
+    """Load per-SKU SB demand classification (Lumpy/Intermittent/...), keyed by sku_id.
+
+    Unlike the other sources here, this is not time-based: it carries one row
+    per unique_id (sku_id) rather than one row per date, so add_feature joins
+    it on 'sku_id' instead of 'month'.
+    """
+    return _load_source_by_id(
+        "API_SOURCES/API_SOURCE_sb_class.csv",
+        "__sb_class__",
+        id_col="unique_id",
+        data_path=data_path,
+    )
+
+
+def get_family(data_path=None) -> pd.DataFrame:
+    """Load per-SKU family/subfamily classification data, keyed by unique_id.
+
+    Not time-based: one row per unique_id (sku_id), so add_feature joins it
+    on 'sku_id' instead of 'month'.
+    """
+    return _load_source_by_id(
+        "API_SOURCES/API_SOURCE_family.csv",
+        "__family__",
+        id_col="unique_id",
+        data_path=data_path,
+    )
+
+
 _SOURCES = {
     "macros": get_macros,
     "suzuki_vehicle_sales_monthly_post_2014": get_suzuki_vehicle_sales_monthly_post_2014,
@@ -116,7 +176,9 @@ _SOURCES = {
     "daylight": get_daylight,
     "parc_allbrands": get_parc_allbrands,
     "suzuki_claims": get_suzuki_claims,
-    "suzuki_fleet_size": get_suzuki_fleet_size
+    "suzuki_fleet_size": get_suzuki_fleet_size,
+    #"sb_class": get_sb_class,
+    "family": get_family
 }
 
 
@@ -237,42 +299,52 @@ def add_feature(df, name, data_path=None):
     Add a feature column to a collision-sales-format DataFrame.
 
     Fetches the feature data identified by `name` (same syntax as get_feature)
-    and left-joins it onto `df` using the feature 'date' index aligned to
-    the 'month' column of `df`.
+    and left-joins it onto `df`. The join key is inferred from the feature's
+    index:
+      - time-based sources (indexed by 'date')      -> join on df['month']
+      - id-based sources   (indexed by 'unique_id')  -> join on df['sku_id']
 
     Args:
         df:        DataFrame in get_collision_sales_df() format, with a 'month'
-                   column of month-start datetimes.
+                   column of month-start datetimes and a 'sku_id' column.
         name:      Source identifier passed to get_feature(). Supports the same
                    '<group>' and '<group>#<field>' syntax.
         data_path: Optional path to the DATA directory. Passed through to
                    get_feature().
 
     Returns:
-        A copy of `df` with the feature column(s) appended (left join on 'month').
+        A copy of `df` with the feature column(s) appended (left join).
 
     Examples:
-        add_feature(df, 'macros#bank_lending_rate')
-        add_feature(df, 'daylight')
-        add_feature(df, 'suzuki_vehicle_sales_monthly_post_2014#total_units')
+        add_feature(df, 'macros#bank_lending_rate')  # joins on 'month'
+        add_feature(df, 'daylight')                  # joins on 'month'
+        add_feature(df, 'sb_class')                  # joins on 'sku_id'
     """
     feature = get_feature(name, data_path=data_path)
-    result = (
-        df.merge(feature.reset_index(), left_on="month", right_on="date", how="left")
-          .drop(columns=["date"])
-    )
+    index_name = feature.index.name
+    if index_name == "date":
+        left_on, right_on = "month", "date"
+    elif index_name == "unique_id":
+        left_on, right_on = "sku_id", "unique_id"
+    else:
+        raise ValueError(
+            f"add_feature({name!r}): don't know how to join on feature index "
+            f"{index_name!r} (expected 'date' or 'unique_id')"
+        )
+
+    result = df.merge(feature.reset_index(), left_on=left_on, right_on=right_on, how="left")
+    if right_on != left_on:
+        result = result.drop(columns=[right_on])
+
     null_cols = [c for c in feature.columns if result[c].isna().all()]
     if null_cols:
-        df_dates  = df["month"].dropna().head(3).tolist()
-        feat_dates = feature.reset_index()["date"].dropna().head(3).tolist()
+        left_sample  = df[left_on].dropna().head(3).tolist()
+        right_sample = feature.reset_index()[right_on].dropna().head(3).tolist()
         raise ValueError(
             f"add_feature({name!r}): join produced no matches — "
             f"all values for {null_cols} are NaN.\n"
-            f"  'month' sample (left):  {df_dates}\n"
-            f"  'date'  sample (right): {feat_dates}"
+            f"  {left_on!r} sample (left):  {left_sample}\n"
+            f"  {right_on!r} sample (right): {right_sample}"
         )
     return result
 
-
-
-list_feature_groups()
