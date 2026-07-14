@@ -304,10 +304,6 @@ def subset_panel(full_panel, active_windows, sku_ids):
             active_windows[active_windows["sku_id"].isin(sku_ids)].reset_index(drop=True))
 
 
-collision_sales = get_collision_sales_df()
-collision_sales.head()
-
-
 #Edwin: Moved here.
 # forecast protocol constants — fixed by the project spec. Moved here from
 # eptools.modelling since fold generation now lives in this module.
