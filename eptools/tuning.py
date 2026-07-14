@@ -12,6 +12,7 @@ Contract recap:
 
 import optuna
 import pandas as pd
+from optuna.storages import RDBStorage
 
 from eptools.modelling import (
     get_collision_sales_df, get_sku_active_windows, build_full_panel, classify_sb,
@@ -120,6 +121,27 @@ class TuningResult:
         return path
 
 
+
+# Postgres engine settings that keep us well under Supabase's session-pooler
+# client cap (free tier: 15 total). A SINGLE shared engine with a small pool,
+# reused across every study, is the whole trick -- passing a URL string to
+# create_study instead builds a fresh engine (and pool) per call and leaks them.
+_PG_ENGINE_KWARGS = {"pool_size": 2, "max_overflow": 3,
+                     "pool_pre_ping": True, "pool_recycle": 300}
+
+
+def _build_storage(storage):
+    """Return (storage_obj, owns). A URL string is wrapped in ONE RDBStorage
+    (capped pool for Postgres); an existing storage object is passed through
+    untouched. `owns` says whether we created the engine and must dispose it."""
+    if storage is None:
+        storage = "sqlite:///optuna_tuning.db"
+    if isinstance(storage, str):
+        kw = _PG_ENGINE_KWARGS if storage.startswith(("postgresql", "postgres")) else {}
+        return RDBStorage(url=storage, engine_kwargs=kw), True
+    return storage, False
+
+
 def tune_over_sb_classes(forecast_fn, search_space, *, model_name,
                          storage=None, n_trials=30, sb_classes=SB_CLASSES,
                          min_train_months=12, objective_metric="pooled",
@@ -138,10 +160,12 @@ def tune_over_sb_classes(forecast_fn, search_space, *, model_name,
         Identity used in study names.
     storage : str or None
         Optuna storage. Pass your Supabase Postgres connection string here from
-        the CONSUMING notebook. Use the DIRECT connection (port 5432), NOT the
-        transaction pooler -- Optuna's prepared statements break under PgBouncer
-        transaction-mode pooling. If None, falls back to a local sqlite file so
-        the code runs offline.
+        the CONSUMING notebook. Use the SESSION POOLER (host
+        aws-0-<region>.pooler.supabase.com, user postgres.<ref>, port 5432): it
+        is IPv4 (the direct host db.<ref>.supabase.co is IPv6-only and often
+        won't resolve) and session-mode, so Optuna's prepared statements are
+        safe. Do NOT use the Transaction pooler (port 6543). If None, falls back
+        to a local sqlite file so the code runs offline.
     objective_metric : {"pooled", "rolling3"}
         Which WMAPE the search minimises. Both are always recorded per trial.
 
@@ -163,47 +187,115 @@ def tune_over_sb_classes(forecast_fn, search_space, *, model_name,
             print("[tuning] contract pre-check skipped (model needs params); "
                   "first trial will surface any issue.")
 
-    if storage is None:
-        storage = "sqlite:///optuna_tuning.db"
-        if verbose:
-            print(f"[tuning] no storage given -> local fallback: {storage}")
+    if storage is None and verbose:
+        print("[tuning] no storage given -> local fallback: sqlite:///optuna_tuning.db")
 
+    # ONE shared, pool-capped storage reused by every study (see _build_storage).
+    storage_obj, owns_storage = _build_storage(storage)
     full_panel, windows, sb_lookup = load_data_cached()
 
     studies, skipped = {}, {}
-    for sb_class in sb_classes:
-        skus = get_skus_by_segment(sb_lookup, "sb_class", [sb_class])
-        panel, panel_windows = subset_panel(full_panel, windows, skus)
+    try:
+      for sb_class in sb_classes:
+          skus = get_skus_by_segment(sb_lookup, "sb_class", [sb_class])
+          panel, panel_windows = subset_panel(full_panel, windows, skus)
 
-        study = optuna.create_study(
-            study_name=build_study_name(model_name, sb_class, min_train_months, dataset_tag),
-            storage=storage, direction=direction, load_if_exists=load_if_exists,
-            sampler=sampler or optuna.samplers.TPESampler(seed=seed),
-        )
-        study.set_user_attr("model_name", model_name)
-        study.set_user_attr("sb_class", sb_class)
-        study.set_user_attr("min_train_months", min_train_months)
-        study.set_user_attr("objective_metric", objective_metric)
-        study.set_user_attr("n_skus", int(len(skus)))
+          study = optuna.create_study(
+              study_name=build_study_name(model_name, sb_class, min_train_months, dataset_tag),
+              storage=storage_obj, direction=direction, load_if_exists=load_if_exists,
+              sampler=sampler or optuna.samplers.TPESampler(seed=seed),
+          )
+          study.set_user_attr("model_name", model_name)
+          study.set_user_attr("sb_class", sb_class)
+          study.set_user_attr("min_train_months", min_train_months)
+          study.set_user_attr("objective_metric", objective_metric)
+          study.set_user_attr("n_skus", int(len(skus)))
 
-        objective = make_objective(forecast_fn, search_space, panel, panel_windows,
-                                   min_train_months, objective_metric)
+          objective = make_objective(forecast_fn, search_space, panel, panel_windows,
+                                     min_train_months, objective_metric)
 
-        # catch=(Exception,) => a failing trial is marked FAILED rather than
-        # aborting the whole sweep (e.g. a class too sparse to make folds).
-        study.optimize(objective, n_trials=n_trials, catch=(Exception,))
+          # catch=(Exception,) => a failing trial is marked FAILED rather than
+          # aborting the whole sweep (e.g. a class too sparse to make folds).
+          study.optimize(objective, n_trials=n_trials, catch=(Exception,))
 
-        complete = [t for t in study.trials
-                    if t.state == optuna.trial.TrialState.COMPLETE]
-        if complete:
-            studies[sb_class] = study
-            if verbose:
-                print(f"  {sb_class:>13}: {len(skus):>4} SKUs | "
-                      f"best {objective_metric} WMAPE={study.best_value:.4f} | "
-                      f"{study.best_params}")
-        else:
-            skipped[sb_class] = "no successful trials (class likely too sparse for folds)"
-            if verbose:
-                print(f"  {sb_class:>13}: SKIPPED -- {skipped[sb_class]}")
+          complete = [t for t in study.trials
+                      if t.state == optuna.trial.TrialState.COMPLETE]
+          if complete:
+              studies[sb_class] = study
+              if verbose:
+                  print(f"  {sb_class:>13}: {len(skus):>4} SKUs | "
+                        f"best {objective_metric} WMAPE={study.best_value:.4f} | "
+                        f"{study.best_params}")
+          else:
+              skipped[sb_class] = "no successful trials (class likely too sparse for folds)"
+              if verbose:
+                  print(f"  {sb_class:>13}: SKIPPED -- {skipped[sb_class]}")
+
+    finally:
+        if owns_storage:
+            # release pooled connections so we don't hold session-mode clients
+            try:
+                storage_obj.engine.dispose()
+            except Exception:
+                pass
 
     return TuningResult(model_name, studies, skipped)
+
+
+def summarise_all_studies(storage, winners_only=False, sort_by="best_value"):
+    """Pull EVERY study from ``storage`` and return a best-per-(model, class)
+    leaderboard as a DataFrame.
+
+    Complements the Optuna dashboard: the dashboard is strong on per-study
+    drill-down but weak at comparing many studies (model x class) side by side.
+    Point this at the same connection string the sweeps wrote to.
+
+    Reads the study-level user attrs that tune_over_sb_classes stamps
+    (model_name, sb_class, objective_metric, n_skus); for any study missing them
+    it falls back to parsing the build_study_name convention
+    (``model__class__mtmXX__tag``). Studies with no completed trial appear with
+    null metrics rather than being dropped.
+
+    winners_only : if True, collapse to the single best study per sb_class.
+    """
+    storage_obj, owns_storage = _build_storage(storage)
+    try:
+        summaries = optuna.get_all_study_summaries(storage_obj)
+    finally:
+        if owns_storage:
+            try:
+                storage_obj.engine.dispose()
+            except Exception:
+                pass
+    rows = []
+    for s in summaries:
+        ua = s.user_attrs or {}
+        model, sb_class = ua.get("model_name"), ua.get("sb_class")
+        if model is None or sb_class is None:
+            parts = s.study_name.split("__")
+            model = model or (parts[0] if len(parts) > 0 else None)
+            sb_class = sb_class or (parts[1] if len(parts) > 1 else None)
+        bt = s.best_trial
+        rows.append({
+            "model": model,
+            "sb_class": sb_class,
+            "objective_metric": ua.get("objective_metric"),
+            "best_value": (bt.value if bt is not None else None),
+            "pooled_wmape": (bt.user_attrs.get("pooled_wmape") if bt is not None else None),
+            "rolling3_wmape": (bt.user_attrs.get("rolling3_wmape") if bt is not None else None),
+            "best_params": (bt.params if bt is not None else None),
+            "n_trials": s.n_trials,
+            "n_skus": ua.get("n_skus"),
+            "study_name": s.study_name,
+        })
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    df = df.sort_values(["sb_class", sort_by], na_position="last").reset_index(drop=True)
+
+    if winners_only:
+        scored = df.dropna(subset=["best_value"])
+        idx = scored.groupby("sb_class")["best_value"].idxmin()
+        df = df.loc[idx].sort_values("sb_class").reset_index(drop=True)
+    return df
