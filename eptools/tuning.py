@@ -16,7 +16,7 @@ from optuna.storages import RDBStorage
 
 from eptools.modelling import (
     get_collision_sales_df, get_sku_active_windows, build_full_panel, classify_sb,
-    get_skus_by_segment, subset_panel, run_backtest, pooled_wmape,
+    segment_scope, run_backtest, pooled_wmape,
     rolling_average_wmape, validate_forecast_fn,
 )
 
@@ -169,6 +169,18 @@ def tune_over_sb_classes(forecast_fn, search_space, *, model_name,
     objective_metric : {"pooled", "rolling3"}
         Which WMAPE the search minimises. Both are always recorded per trial.
 
+    Routing notes
+    -------------
+    Each class's study is scored via segment_scope(forecast_fn, [sb_class]),
+    which reclassifies every fold from that fold's own train_df -- so a SKU
+    that drifts class over its life (e.g. Lumpy -> Smooth) is scored under
+    whichever class it actually was at that fold's origin, not whatever it
+    ends up classified as over its full history. sb_lookup (retrospective,
+    whole-panel classify_sb) is used ONLY to report a current SKU count per
+    class -- never to decide which SKUs a fold forecasts. See classify_sb's
+    own docstring: the retrospective label is for slicing/reporting, not
+    routing.
+
     Returns
     -------
     TuningResult
@@ -197,8 +209,10 @@ def tune_over_sb_classes(forecast_fn, search_space, *, model_name,
     studies, skipped = {}, {}
     try:
       for sb_class in sb_classes:
-          skus = get_skus_by_segment(sb_lookup, "sb_class", [sb_class])
-          panel, panel_windows = subset_panel(full_panel, windows, skus)
+          # Reporting only -- see "Routing notes" above. Actual per-fold
+          # routing happens inside segment_scope via point-in-time classify_sb.
+          n_skus_now = int((sb_lookup["sb_class"] == sb_class).sum())
+          scoped_forecast_fn = segment_scope(forecast_fn, allowed_classes=[sb_class])
 
           study = optuna.create_study(
               study_name=build_study_name(model_name, sb_class, min_train_months, dataset_tag),
@@ -209,9 +223,9 @@ def tune_over_sb_classes(forecast_fn, search_space, *, model_name,
           study.set_user_attr("sb_class", sb_class)
           study.set_user_attr("min_train_months", min_train_months)
           study.set_user_attr("objective_metric", objective_metric)
-          study.set_user_attr("n_skus", int(len(skus)))
+          study.set_user_attr("n_skus", n_skus_now)
 
-          objective = make_objective(forecast_fn, search_space, panel, panel_windows,
+          objective = make_objective(scoped_forecast_fn, search_space, full_panel, windows,
                                      min_train_months, objective_metric)
 
           # catch=(Exception,) => a failing trial is marked FAILED rather than
@@ -223,7 +237,7 @@ def tune_over_sb_classes(forecast_fn, search_space, *, model_name,
           if complete:
               studies[sb_class] = study
               if verbose:
-                  print(f"  {sb_class:>13}: {len(skus):>4} SKUs | "
+                  print(f"  {sb_class:>13}: {n_skus_now:>4} SKUs | "
                         f"best {objective_metric} WMAPE={study.best_value:.4f} | "
                         f"{study.best_params}")
           else:
