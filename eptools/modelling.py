@@ -103,6 +103,9 @@ def load_dataframes(data_path=None) -> dict:
 
 
 
+LAG_MONTHS = 3    # months between the last known observation and the scored forecast month
+HORIZON    = 18   # full forecast curve length in months
+
 # these columns were found to contain either zero values or one value
 REDUNDANT_COLUMNS = [
     "CPI_Housing_Utilities",
@@ -506,8 +509,7 @@ collision_sales.head()
 #Edwin: Moved here.
 # forecast protocol constants — fixed by the project spec. Moved here from
 # eptools.modelling since fold generation now lives in this module.
-LAG_MONTHS = 3    # months between the last known observation and the scored forecast month
-HORIZON    = 18   # full forecast curve length in months
+
 import numpy as np
 from typing import Any, Callable, Dict, Optional
 
@@ -541,6 +543,53 @@ def train_frame(full_panel: pd.DataFrame, origin: pd.Timestamp, window_months: i
     return tf
 
 
+def make_fold(
+    full_panel,
+    active_windows,
+    origin,
+    lag=LAG_MONTHS,
+    horizon=HORIZON,
+    window_months=None,
+    scoring_policy="known_at_origin",
+):
+    """Build one complete fold using the same eligibility rules as the backtest."""
+    origin = pd.Timestamp(origin).to_period("M").to_timestamp()
+    target_date = origin + pd.DateOffset(months=lag)
+    dataset_end = full_panel["month"].max()
+
+    if target_date > dataset_end:
+        raise ValueError(
+            f"Target {target_date:%Y-%m} is after dataset end {dataset_end:%Y-%m}."
+        )
+
+    horizon_end = min(origin + pd.DateOffset(months=horizon), dataset_end)
+    horizon_dates = pd.date_range(origin + pd.DateOffset(months=1),horizon_end,freq="MS",)
+
+    train_df = train_frame(full_panel, origin, window_months=window_months)
+
+    universe = define_scoring_universe(active_windows,origin,target_date,scoring_policy=scoring_policy,)
+
+    target_actuals = full_panel.loc[full_panel["month"] == target_date,["sku_id", "month", "demand"]]
+
+    test_df = pd.DataFrame({"sku_id": sorted(universe["scored_skus"])}).merge(target_actuals, on="sku_id", how="left", validate="one_to_one")
+
+    if test_df["demand"].isna().any():
+        n_missing = int(test_df["demand"].isna().sum())
+        raise ValueError(
+            f"{n_missing:,} eligible SKUs have no actual row for {target_date:%Y-%m}."
+        )
+
+    return {
+        "origin": origin,
+        "target_date": target_date,
+        "horizon_dates": horizon_dates,
+        "train_df": train_df,
+        "test_df": test_df,
+        "scoring_policy": scoring_policy,
+        "known_at_origin": universe["known_at_origin"],
+        "observed_by_target": universe["observed_by_target"],
+        "post_origin_first_sale_skus": universe["post_origin_first_sale_skus"],
+    }
 # def expanding_window_folds(
 #     full_panel: pd.DataFrame,
 #     active_windows: pd.DataFrame,
@@ -611,84 +660,23 @@ def expanding_window_folds(
     )
 
     first_origin_idx = min_train_months - 1
-    last_origin_idx = (
-        len(all_months)
-        - 1
-        - lag
-    )
+    last_origin_idx = len(all_months) - lag - 1
 
     if last_origin_idx < first_origin_idx:
         raise ValueError(
-            f"Not enough months ({len(all_months)}) "
-            f"for min_train_months={min_train_months} "
-            f"and lag={lag}."
+            f"Not enough history for min_train_months={min_train_months} and lag={lag}."
         )
 
-    for origin_idx in range(first_origin_idx, last_origin_idx + 1):
-        origin = all_months[origin_idx]
-        target_date = all_months[origin_idx + lag]
-
-        train_df = train_frame(full_panel, origin, window_months=window_months)
-
-        horizon_end_idx = min(origin_idx + horizon,len(all_months) - 1)
-
-        horizon_dates = all_months[origin_idx + 1: horizon_end_idx + 1]
-
-        universe = define_scoring_universe(active_windows, origin,target_date,scoring_policy=scoring_policy,)
-
-        scored_skus = universe["scored_skus"]
-
-        target_actuals = (
-            full_panel.loc[
-                full_panel["month"] == target_date,
-                [
-                    "sku_id",
-                    "month",
-                    "demand",
-                ],
-            ]
-            .copy()
+    for origin in all_months[first_origin_idx:last_origin_idx + 1]:
+        yield make_fold(
+            full_panel,
+            active_windows,
+            origin,
+            lag=lag,
+            horizon=horizon,
+            window_months=window_months,
+            scoring_policy=scoring_policy,
         )
-
-        test_df = (
-            pd.DataFrame({"sku_id": sorted(scored_skus)})
-            .merge(
-                target_actuals,
-                on="sku_id",
-                how="left",
-                validate="one_to_one",
-            )
-        )
-
-        missing_actuals = test_df["demand"].isna()
-
-        if missing_actuals.any():
-            examples = test_df.loc[missing_actuals,["sku_id"]].head(20)
-
-            display(examples)
-
-            raise ValueError(
-                f"{missing_actuals.sum():,} eligible "
-                f"SKUs do not have a target actual row "
-                f"for {target_date:%Y-%m}."
-            )
-
-        yield {
-            "origin": origin,
-            "target_date": target_date,
-            "horizon_dates": horizon_dates,
-            "train_df": train_df,
-            "test_df": test_df,
-            "scoring_policy": scoring_policy,
-            "known_at_origin": (
-                universe["known_at_origin"]
-            ),
-            "post_origin_first_sale_skus": (
-                universe[
-                    "post_origin_first_sale_skus"
-                ]
-            ),
-        }
 
 
 def validate_forecast_fn(forecast_fn, **kwargs):
@@ -769,11 +757,7 @@ ForecastFn = Callable[..., pd.DataFrame]
 #     merged["target_date"] = target_date
 #     return merged, n_skus_excluded_new
 
-def _joined_fold(
-    fold,
-    preds,
-    cold_start_strategy="error",
-):
+def _joined_fold(fold,preds,cold_start_strategy="error"):
     """
     Join one fold's eligible actuals to its target predictions.
 
@@ -1036,49 +1020,75 @@ def _joined_fold(
 #         "wmape": wmape(merged["demand"], merged["y_pred"]),
 #     }
 
-def _score_fold(fold, preds, cold_start_strategy="error"):
-    """
-    Reduce one strictly validated fold to atomic WMAPE components.
-    """
-    merged, coverage = _joined_fold(
-        fold,
-        preds,
-        cold_start_strategy=(
-            cold_start_strategy
-        ),
-    )
-
-    err = (
-        merged["demand"]
-        - merged["y_pred"]
-    )
-
-    abs_actual_sum = float(
-        merged["demand"].abs().sum()
-    )
+def _score_joined_fold(fold, merged, coverage):
+    """Calculate atomic WMAPE components from an already validated fold join."""
+    error = merged["demand"] - merged["y_pred"]
+    abs_actual_sum = float(merged["demand"].abs().sum())
+    abs_error_sum = float(error.abs().sum())
 
     return {
         "origin": fold["origin"],
         "target_date": fold["target_date"],
-        "scoring_policy": (
-            fold["scoring_policy"]
-        ),
-        "n_skus": int(len(merged)),
+        "scoring_policy": fold["scoring_policy"],
+        "n_skus": len(merged),
         **coverage,
-        "abs_error_sum": float(
-            err.abs().sum()
-        ),
-        "abs_actual_sum": (
-            abs_actual_sum
-        ),
-        "error_sum": float(
-            err.sum()
-        ),
-        "wmape": wmape(
-            merged["demand"],
-            merged["y_pred"],
-        ),
+        "abs_error_sum": abs_error_sum,
+        "abs_actual_sum": abs_actual_sum,
+        "error_sum": float(error.sum()),
+        "wmape": abs_error_sum / abs_actual_sum if abs_actual_sum > 0 else np.nan
     }
+    
+def _score_fold(fold, preds, cold_start_strategy="error"):
+    """Validate and score one forecast fold."""
+    merged, coverage = _joined_fold(
+        fold, preds,
+        cold_start_strategy=cold_start_strategy
+    )
+    return _score_joined_fold(fold, merged, coverage)
+
+# def _score_fold(fold, preds, cold_start_strategy="error"):
+#     """
+#     Reduce one strictly validated fold to atomic WMAPE components.
+#     """
+#     merged, coverage = _joined_fold(
+#         fold,
+#         preds,
+#         cold_start_strategy=(
+#             cold_start_strategy
+#         ),
+#     )
+
+#     err = (
+#         merged["demand"]
+#         - merged["y_pred"]
+#     )
+
+#     abs_actual_sum = float(
+#         merged["demand"].abs().sum()
+#     )
+
+#     return {
+#         "origin": fold["origin"],
+#         "target_date": fold["target_date"],
+#         "scoring_policy": (
+#             fold["scoring_policy"]
+#         ),
+#         "n_skus": int(len(merged)),
+#         **coverage,
+#         "abs_error_sum": float(
+#             err.abs().sum()
+#         ),
+#         "abs_actual_sum": (
+#             abs_actual_sum
+#         ),
+#         "error_sum": float(
+#             err.sum()
+#         ),
+#         "wmape": wmape(
+#             merged["demand"],
+#             merged["y_pred"],
+#         ),
+#     }
     
 # def _score_fold_segments(fold, preds, sku_segment, segment_col="sb_class"):
 #     """Same join as _score_fold, grouped by segment_col before summing.
@@ -1593,100 +1603,352 @@ def plot_sku_horizon_snapshot(forecast_fn, full_panel, sku_id, origin, params=No
     plt.show()
 
 
-def illustrate_folds(forecast_fn, full_panel, active_windows, sku_ids, origins,
-                      params=None, lag=LAG_MONTHS, horizon=6, show_computations=True,
-                      ylim=None, save_prefix=None):
-    """
-    Walk through a handful of specific origins, one plot per origin, showing
-    the named SKU(s)' known history, forecast curve, and the exact error at
-    the scored (lag) target month. This is the illustrative "here's how the
-    harness works, and how multiple SKUs pool into one WMAPE" view -- for
-    the full rolling series across every origin, use run_backtest directly.
+# def illustrate_folds(forecast_fn, full_panel, active_windows, sku_ids, origins,
+#                       params=None, lag=LAG_MONTHS, horizon=6, show_computations=True,
+#                       ylim=None, save_prefix=None):
+#     """
+#     Walk through a handful of specific origins, one plot per origin, showing
+#     the named SKU(s)' known history, forecast curve, and the exact error at
+#     the scored (lag) target month. This is the illustrative "here's how the
+#     harness works, and how multiple SKUs pool into one WMAPE" view -- for
+#     the full rolling series across every origin, use run_backtest directly.
 
-    sku_ids : a single sku_id, or a list of 2-4 for a comparison view within
-        each fold (more than ~4 gets visually unreadable).
-    origins : specific origin months to illustrate, e.g.
-        ["2021-06-01", "2021-07-01", "2021-08-01", "2021-09-01"]
-    show_computations : if True (default), adds the right-hand text panel
-        with each SKU's actual/forecast/error and the fold's WMAPE. Set
-        False for a cleaner, presentation-only version of the same plot.
+#     sku_ids : a single sku_id, or a list of 2-4 for a comparison view within
+#         each fold (more than ~4 gets visually unreadable).
+#     origins : specific origin months to illustrate, e.g.
+#         ["2021-06-01", "2021-07-01", "2021-08-01", "2021-09-01"]
+#     show_computations : if True (default), adds the right-hand text panel
+#         with each SKU's actual/forecast/error and the fold's WMAPE. Set
+#         False for a cleaner, presentation-only version of the same plot.
+#     """
+#     params = params or {}
+#     if isinstance(sku_ids, str):
+#         sku_ids = [sku_ids]
+
+#     colors = ["#2a78d6", "#e07b39", "#4caf50", "#9c27b0"]
+#     origins = sorted(pd.Timestamp(o) for o in origins)
+
+#     if ylim is None:
+#         relevant = full_panel[full_panel["sku_id"].isin(sku_ids)]["demand"]
+#         ylim = (0, relevant.max() * 1.3)
+
+#     for i, origin in enumerate(origins, start=1):
+#         target_date = origin + pd.DateOffset(months=lag)
+#         all_months = pd.date_range(full_panel["month"].min(), full_panel["month"].max(), freq="MS")
+#         origin_idx = all_months.get_loc(origin)
+#         horizon_end_idx = min(origin_idx + horizon, len(all_months) - 1)
+#         horizon_dates = all_months[origin_idx + 1: horizon_end_idx + 1]
+
+#         train_df = train_frame(full_panel, origin)
+#         scored_skus = active_skus_at(active_windows, target_date)
+#         test_df = full_panel.loc[(full_panel["month"] == target_date) & (full_panel["sku_id"].isin(scored_skus))].copy()
+        
+#         # fold = {"origin": origin, "target_date": target_date, "horizon_dates": horizon_dates,
+#         #         "train_df": train_df, "test_df": test_df}
+
+#         # preds = forecast_fn(train_df, horizon=len(horizon_dates), **params)
+#         # row = _score_fold(fold, preds)
+#         # merged, _ = _joined_fold(fold, preds)
+        
+#         fold = make_fold(full_panel,active_windows,origin,lag=lag,horizon=horizon,scoring_policy="known_at_origin")
+
+#         preds = forecast_fn(fold["train_df"],horizon=len(fold["horizon_dates"]),**params)
+#         row = _score_fold(fold, preds, cold_start_strategy="error")
+#         merged, _ = _joined_fold(fold, preds, cold_start_strategy="error")
+
+#         if show_computations:
+#             fig, axes = plt.subplots(1, 2, figsize=(13, 4.3), gridspec_kw={"width_ratios": [2.3, 1]})
+#             ax, ax2 = axes
+#         else:
+#             fig, ax = plt.subplots(figsize=(11, 4.3))
+
+#         for sku, color in zip(sku_ids, colors):
+#             hist = full_panel[(full_panel["sku_id"] == sku) & (full_panel["month"] <= origin)]
+#             ax.plot(hist["month"], hist["demand"], marker="o", color=color, label=f"{sku} actual (known)")
+
+#             fc_sku = preds[preds["sku_id"] == sku]
+#             ax.plot(fc_sku["month"], fc_sku["y_pred"], marker="s", linestyle="--", color=color,
+#                     alpha=0.6, label=f"{sku} forecast")
+
+#             act_row = full_panel[(full_panel["sku_id"] == sku) & (full_panel["month"] == target_date)]
+#             fc_row = fc_sku[fc_sku["month"] == target_date]
+#             if len(act_row) and len(fc_row):
+#                 a, f = act_row["demand"].values[0], fc_row["y_pred"].values[0]
+#                 ax.plot([target_date, target_date], [a, f], color=color, linewidth=3, zorder=5)
+#                 ax.scatter([target_date], [a], color=color, s=70, zorder=6, edgecolor="black")
+#                 ax.scatter([target_date], [f], color=color, marker="s", s=70, zorder=6, edgecolor="black")
+#                 ax.annotate(f"|err|={abs(a-f):.2f}", (target_date, max(a, f) + ylim[1]*0.03),
+#                             ha="center", fontsize=8, color=color)
+
+#         ax.axvline(origin, color="black", linestyle=":", linewidth=1.2)
+#         ax.axvline(target_date, color="gray", linestyle=":", linewidth=1.2)
+#         ax.set_ylim(*ylim)
+#         ax.set_title(f"Fold {i}: origin={origin.strftime('%b %Y')}  ->  scored at {target_date.strftime('%b %Y')}")
+#         ax.legend(fontsize=7, loc="lower left")
+
+#         if show_computations:
+#             ax2.axis("off")
+#             lines = [f"Target: {target_date.strftime('%b %Y')}", ""]
+#             for r in merged[merged["sku_id"].isin(sku_ids)].itertuples():
+#                 lines.append(f"{r.sku_id}: actual={r.demand:.0f}  forecast={r.y_pred:.2f}  "
+#                              f"|err|={abs(r.demand - r.y_pred):.2f}")
+#             lines += ["", f"sum |errors| (all scored SKUs) = {row['abs_error_sum']:.3f}",
+#                       f"sum |actuals| (all scored SKUs) = {row['abs_actual_sum']:.3f}", "",
+#                       f"WMAPE = {row['wmape']:.4f}"]
+#             ax2.text(0.02, 0.95, "\n".join(lines), va="top", fontsize=10.5, family="monospace")
+
+#         plt.tight_layout()
+#         if save_prefix:
+#             plt.savefig(f"{save_prefix}_fold{i}_{origin.strftime('%b').lower()}.png", bbox_inches="tight")
+#         plt.show()
+#         print(f"  Fold {i}: origin={origin.date()}  target={target_date.date()}  WMAPE={row['wmape']:.4f}")
+
+def illustrate_folds(
+    forecast_fn, full_panel, active_windows, sku_ids, origins, params=None,
+    lag=LAG_MONTHS, horizon=6, window_months=None,
+    scoring_policy="known_at_origin", cold_start_strategy="error",
+    show_computations=True, ylim=None, save_prefix=None
+):
+    """
+    Illustrate selected rolling-origin folds.
+
+    Each plot shows:
+    - demand history available at the forecast origin;
+    - the model's forecast horizon;
+    - actual and forecast demand at the scored target month;
+    - the target-month absolute error for each requested SKU;
+    - optionally, the pooled WMAPE across the complete scoring universe.
+
+    Parameters
+    ----------
+    forecast_fn : callable
+        Forecast function with signature forecast_fn(train_df, horizon, **params).
+
+    full_panel : pd.DataFrame
+        Monthly SKU demand panel.
+
+    active_windows : pd.DataFrame
+        SKU first-observed and last-observed dates.
+
+    sku_ids : str or list[str]
+        SKUs to display.
+
+    origins : iterable
+        Forecast-origin months to illustrate.
+
+    scoring_policy : {"known_at_origin", "all_observed_by_target"}
+        Evaluation-universe policy.
+
+    cold_start_strategy : {"error", "zero"}
+        Treatment of eligible post-origin first-sale SKUs without forecasts.
+
+    Notes
+    -----
+    The fold is constructed by make_fold(), ensuring that this visualisation
+    uses the same eligibility and scoring rules as run_backtest().
     """
     params = params or {}
-    if isinstance(sku_ids, str):
-        sku_ids = [sku_ids]
+    sku_ids = [sku_ids] if isinstance(sku_ids, str) else list(sku_ids)
+    origins = sorted(pd.Timestamp(origin).to_period("M").to_timestamp() for origin in origins)
 
-    colors = ["#2a78d6", "#e07b39", "#4caf50", "#9c27b0"]
-    origins = sorted(pd.Timestamp(o) for o in origins)
+    if not sku_ids:
+        raise ValueError("Provide at least one SKU.")
+
+    if horizon < lag:
+        raise ValueError(
+            f"horizon={horizon} does not reach the scored target at lag={lag}. "
+            f"Use horizon >= {lag}."
+        )
+
+    missing_skus = set(sku_ids) - set(full_panel["sku_id"])
+    if missing_skus:
+        raise ValueError(f"Requested SKUs are not present in full_panel: {sorted(missing_skus)}")
+
+    colors = ["#2a78d6", "#e07b39", "#4caf50", "#9c27b0", "#795548", "#00acc1"]
+
+    if len(sku_ids) > len(colors):
+        raise ValueError(f"illustrate_folds supports up to {len(colors)} SKUs per plot.")
 
     if ylim is None:
-        relevant = full_panel[full_panel["sku_id"].isin(sku_ids)]["demand"]
-        ylim = (0, relevant.max() * 1.3)
+        relevant = full_panel.loc[full_panel["sku_id"].isin(sku_ids), "demand"]
+        upper = max(float(relevant.max()) * 1.3, 1.0)
+        ylim = (0, upper)
 
-    for i, origin in enumerate(origins, start=1):
-        target_date = origin + pd.DateOffset(months=lag)
-        all_months = pd.date_range(full_panel["month"].min(), full_panel["month"].max(), freq="MS")
-        origin_idx = all_months.get_loc(origin)
-        horizon_end_idx = min(origin_idx + horizon, len(all_months) - 1)
-        horizon_dates = all_months[origin_idx + 1: horizon_end_idx + 1]
+    for fold_number, origin in enumerate(origins, start=1):
+        fold = make_fold(
+            full_panel, active_windows, origin,
+            lag=lag, horizon=horizon, window_months=window_months,
+            scoring_policy=scoring_policy
+        )
 
-        train_df = train_frame(full_panel, origin)
-        scored_skus = active_skus_at(active_windows, target_date)
-        test_df = full_panel.loc[
-            (full_panel["month"] == target_date) & (full_panel["sku_id"].isin(scored_skus))
-        ].copy()
-        fold = {"origin": origin, "target_date": target_date, "horizon_dates": horizon_dates,
-                "train_df": train_df, "test_df": test_df}
+        preds = forecast_fn(
+            fold["train_df"],
+            horizon=len(fold["horizon_dates"]),
+            **params
+        )
 
-        preds = forecast_fn(train_df, horizon=len(horizon_dates), **params)
-        row = _score_fold(fold, preds)
-        merged, _ = _joined_fold(fold, preds)
+        merged, coverage = _joined_fold(
+            fold, preds,
+            cold_start_strategy=cold_start_strategy
+        )
+
+        row = _score_joined_fold(fold, merged, coverage)
 
         if show_computations:
-            fig, axes = plt.subplots(1, 2, figsize=(13, 4.3), gridspec_kw={"width_ratios": [2.3, 1]})
-            ax, ax2 = axes
+            fig, (ax, ax2) = plt.subplots(
+                1, 2, figsize=(13, 4.3),
+                gridspec_kw={"width_ratios": [2.3, 1]}
+            )
         else:
             fig, ax = plt.subplots(figsize=(11, 4.3))
+            ax2 = None
+
+        known_skus = set(fold["known_at_origin"])
+        scored_skus = set(fold["test_df"]["sku_id"])
 
         for sku, color in zip(sku_ids, colors):
-            hist = full_panel[(full_panel["sku_id"] == sku) & (full_panel["month"] <= origin)]
-            ax.plot(hist["month"], hist["demand"], marker="o", color=color, label=f"{sku} actual (known)")
+            sku_known = sku in known_skus
+            sku_scored = sku in scored_skus
 
-            fc_sku = preds[preds["sku_id"] == sku]
-            ax.plot(fc_sku["month"], fc_sku["y_pred"], marker="s", linestyle="--", color=color,
-                    alpha=0.6, label=f"{sku} forecast")
+            history = full_panel.loc[
+                (full_panel["sku_id"] == sku) &
+                (full_panel["month"] <= fold["origin"])
+            ].sort_values("month")
 
-            act_row = full_panel[(full_panel["sku_id"] == sku) & (full_panel["month"] == target_date)]
-            fc_row = fc_sku[fc_sku["month"] == target_date]
-            if len(act_row) and len(fc_row):
-                a, f = act_row["demand"].values[0], fc_row["y_pred"].values[0]
-                ax.plot([target_date, target_date], [a, f], color=color, linewidth=3, zorder=5)
-                ax.scatter([target_date], [a], color=color, s=70, zorder=6, edgecolor="black")
-                ax.scatter([target_date], [f], color=color, marker="s", s=70, zorder=6, edgecolor="black")
-                ax.annotate(f"|err|={abs(a-f):.2f}", (target_date, max(a, f) + ylim[1]*0.03),
-                            ha="center", fontsize=8, color=color)
+            if not history.empty:
+                ax.plot(
+                    history["month"], history["demand"],
+                    marker="o", color=color,
+                    label=f"{sku} actual history"
+                )
 
-        ax.axvline(origin, color="black", linestyle=":", linewidth=1.2)
-        ax.axvline(target_date, color="gray", linestyle=":", linewidth=1.2)
+            sku_preds = preds.loc[preds["sku_id"] == sku].sort_values("month")
+
+            if not sku_preds.empty:
+                ax.plot(
+                    sku_preds["month"], sku_preds["y_pred"],
+                    marker="s", linestyle="--", color=color, alpha=0.65,
+                    label=f"{sku} forecast"
+                )
+
+            scored_row = merged.loc[merged["sku_id"] == sku]
+
+            if not scored_row.empty:
+                actual = float(scored_row["demand"].iloc[0])
+                forecast = float(scored_row["y_pred"].iloc[0])
+                error = abs(actual - forecast)
+                target = fold["target_date"]
+
+                ax.plot(
+                    [target, target], [actual, forecast],
+                    color=color, linewidth=3, zorder=5
+                )
+                ax.scatter(
+                    target, actual, color=color, s=70,
+                    edgecolor="black", zorder=6
+                )
+                ax.scatter(
+                    target, forecast, color=color, marker="s", s=70,
+                    edgecolor="black", zorder=6
+                )
+                ax.annotate(
+                    f"|err|={error:.2f}",
+                    (target, max(actual, forecast) + ylim[1] * 0.03),
+                    ha="center", fontsize=8, color=color
+                )
+
+            elif not sku_known:
+                print(
+                    f"Fold {fold_number}, origin {origin:%Y-%m}: "
+                    f"{sku} had no observed history at the origin, "
+                    "so no standard forecast was available."
+                )
+            elif not sku_scored:
+                print(
+                    f"Fold {fold_number}, origin {origin:%Y-%m}: "
+                    f"{sku} was not included under scoring_policy="
+                    f"'{scoring_policy}'."
+                )
+
+        ax.axvline(
+            fold["origin"], color="black",
+            linestyle=":", linewidth=1.2, label="forecast origin"
+        )
+        ax.axvline(
+            fold["target_date"], color="gray",
+            linestyle=":", linewidth=1.2, label="scored target"
+        )
+
         ax.set_ylim(*ylim)
-        ax.set_title(f"Fold {i}: origin={origin.strftime('%b %Y')}  ->  scored at {target_date.strftime('%b %Y')}")
+        ax.set_title(
+            f"Fold {fold_number}: origin={fold['origin']:%b %Y} "
+            f"→ scored at {fold['target_date']:%b %Y}"
+        )
+        ax.set_xlabel("Month")
+        ax.set_ylabel("Demand")
         ax.legend(fontsize=7, loc="lower left")
 
         if show_computations:
             ax2.axis("off")
-            lines = [f"Target: {target_date.strftime('%b %Y')}", ""]
-            for r in merged[merged["sku_id"].isin(sku_ids)].itertuples():
-                lines.append(f"{r.sku_id}: actual={r.demand:.0f}  forecast={r.y_pred:.2f}  "
-                             f"|err|={abs(r.demand - r.y_pred):.2f}")
-            lines += ["", f"sum |errors| (all scored SKUs) = {row['abs_error_sum']:.3f}",
-                      f"sum |actuals| (all scored SKUs) = {row['abs_actual_sum']:.3f}", "",
-                      f"WMAPE = {row['wmape']:.4f}"]
-            ax2.text(0.02, 0.95, "\n".join(lines), va="top", fontsize=10.5, family="monospace")
+            requested_rows = merged.loc[merged["sku_id"].isin(sku_ids)]
+            lines = [
+                f"Origin: {fold['origin']:%b %Y}",
+                f"Target: {fold['target_date']:%b %Y}",
+                f"Policy: {scoring_policy}",
+                ""
+            ]
+
+            for result in requested_rows.itertuples():
+                error = abs(result.demand - result.y_pred)
+                lines.append(
+                    f"{result.sku_id}:\n"
+                    f"  actual={result.demand:.0f}\n"
+                    f"  forecast={result.y_pred:.2f}\n"
+                    f"  |error|={error:.2f}"
+                )
+
+            requested_not_scored = [sku for sku in sku_ids if sku not in set(requested_rows["sku_id"])]
+            for sku in requested_not_scored:
+                status = (
+                    "not observed at origin"
+                    if sku not in known_skus
+                    else "not in scoring universe"
+                )
+                lines.append(f"{sku}:\n  {status}")
+
+            lines.extend([
+                "",
+                "Complete scoring universe:",
+                f"  SKUs={row['n_skus']:,}",
+                f"  sum |errors|={row['abs_error_sum']:.3f}",
+                f"  sum |actuals|={row['abs_actual_sum']:.3f}",
+                f"  WMAPE={row['wmape']:.4f}"
+            ])
+
+            if coverage["n_cold_start_skus_defaulted"]:
+                lines.append(
+                    f"  cold-start zeros="
+                    f"{coverage['n_cold_start_skus_defaulted']:,}"
+                )
+
+            ax2.text(
+                0.02, 0.97, "\n".join(lines),
+                va="top", fontsize=9.5, family="monospace"
+            )
 
         plt.tight_layout()
+
         if save_prefix:
-            plt.savefig(f"{save_prefix}_fold{i}_{origin.strftime('%b').lower()}.png", bbox_inches="tight")
+            filename = f"{save_prefix}_fold{fold_number}_{origin:%Y-%m}.png"
+            plt.savefig(filename, bbox_inches="tight")
+
         plt.show()
-        print(f"  Fold {i}: origin={origin.date()}  target={target_date.date()}  WMAPE={row['wmape']:.4f}")
+
+        print(
+            f"Fold {fold_number}: origin={fold['origin'].date()}  "
+            f"target={fold['target_date'].date()}  "
+            f"n_skus={row['n_skus']:,}  WMAPE={row['wmape']:.4f}"
+        )
 
 
 # Same palette already used across the project's own plotting functions
@@ -1965,8 +2227,3 @@ def combine_segment_results(*results_dfs, on=("origin", "target_date")):
 #         preds = forecast_fn(fold["train_df"], horizon=len(fold["horizon_dates"]), **params)
 #         all_segs.append(_score_fold_segments(fold, preds, sku_segment, segment_col=segment_col))
 #     return pd.concat(all_segs, ignore_index=True)
-
-
-# # NOTEBOOK_ONLY
-# tsb_segmented = run_backtest_segmented(tsb_forecast_fn, full_panel, windows, sb_lookup, min_train_months=12)
-# pooled_wmape(tsb_segmented, by="sb_class")            # one number per segment, whole backtest
