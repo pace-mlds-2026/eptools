@@ -50,18 +50,27 @@ def build_study_name(model_name, sb_class, min_train_months, dataset_tag="v1"):
 
 
 def make_objective(forecast_fn, search_space, panel, panel_windows,
-                   min_train_months, objective_metric):
+                   min_train_months, objective_metric, cold_start_strategy="zero"):
     """Build the Optuna objective for one class's panel.
 
     Records BOTH pooled and 3-month-rolling WMAPE on every trial regardless of
     which one is optimised, so reporting against the scope's rolling metric
     never needs a re-run.
+
+    cold_start_strategy="zero": run_backtest raises by default
+    (cold_start_strategy="error") on any SKU that launches partway through
+    the backtest with no prediction available for it yet. The real panel has
+    thousands of such fold-SKU cases across a full backtest, so the strict
+    default would abort almost every trial immediately. "zero" scores those
+    as an explicit zero forecast instead, matching this module's older,
+    pre-strict-validation behaviour.
     """
     def objective(trial):
         params = search_space(trial)
         results = run_backtest(
             forecast_fn, panel, panel_windows,
             params=params, min_train_months=min_train_months,
+            cold_start_strategy=cold_start_strategy,
         )
         pooled = float(pooled_wmape(results))
         rolling = rolling_average_wmape(results, window=3, method="pooled")
@@ -146,6 +155,7 @@ def tune_over_sb_classes(forecast_fn, search_space, *, model_name,
                          storage=None, n_trials=30, sb_classes=SB_CLASSES,
                          min_train_months=12, objective_metric="pooled",
                          direction="minimize", sampler=None,
+                         cold_start_strategy="zero",
                          load_if_exists=True, dataset_tag="v1", seed=42,
                          verbose=True):
     """Tune one contract-compliant model across the SB classes, minimising WMAPE.
@@ -168,6 +178,14 @@ def tune_over_sb_classes(forecast_fn, search_space, *, model_name,
         to a local sqlite file so the code runs offline.
     objective_metric : {"pooled", "rolling3"}
         Which WMAPE the search minimises. Both are always recorded per trial.
+    cold_start_strategy : {"zero", "error"}
+        Passed through to run_backtest via make_objective. run_backtest's own
+        default is "error" -- raise on any SKU that launches partway through
+        a backtest with no prediction yet available for it. The real panel
+        has thousands of these fold-SKU cases across a full backtest, so
+        that default would abort almost every trial immediately here. "zero"
+        (this function's default) scores them as an explicit zero forecast
+        instead.
 
     Routing notes
     -------------
@@ -226,7 +244,8 @@ def tune_over_sb_classes(forecast_fn, search_space, *, model_name,
           study.set_user_attr("n_skus", n_skus_now)
 
           objective = make_objective(scoped_forecast_fn, search_space, full_panel, windows,
-                                     min_train_months, objective_metric)
+                                     min_train_months, objective_metric,
+                                     cold_start_strategy=cold_start_strategy)
 
           # catch=(Exception,) => a failing trial is marked FAILED rather than
           # aborting the whole sweep (e.g. a class too sparse to make folds).
