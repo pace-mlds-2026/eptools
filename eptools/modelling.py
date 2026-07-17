@@ -413,7 +413,7 @@ def load_collision_backtest_data():
     a different date range, a test panel)."""
     collision_sales = get_collision_sales_df()
     windows = get_sku_active_windows(collision_sales)
-    full_panel = build_full_panel(collision_sales, windows)
+    full_panel = build_full_panel(collision_sales, windows, fill_internal_gaps=False)
     return full_panel, windows
 
 
