@@ -178,35 +178,230 @@ def get_collision_sales_dictionary():
 
 
 #Edwin: Newly added functions for correctly getting the right data slices.
+# def get_sku_active_windows(panel):
+#     """
+#     One row per SKU: first_seen, last_seen. This is the scoring universe --
+#     which months a SKU is genuinely in scope for -- as distinct from a
+#     model's own training window.
+#     """
+#     return panel.groupby("sku_id")["month"].agg(first_seen="min", last_seen="max").reset_index()
+
 def get_sku_active_windows(panel):
     """
-    One row per SKU: first_seen, last_seen. This is the scoring universe --
-    which months a SKU is genuinely in scope for -- as distinct from a
-    model's own training window.
+    One row per SKU containing the first and final row observed in the
+    supplied extract.
+
+    Important:
+    - first_seen is the first observed SKU-month in the extract. Inchcape
+      describes this as the first observed invoiced sale, not necessarily
+      the product introduction date.
+    - last_seen is the final observed row in the extract, not necessarily
+      a retirement or discontinuation date.
+
+    In the current Chile Suzuki collision panel, every SKU continues through
+    the dataset end, April 2026.
     """
-    return panel.groupby("sku_id")["month"].agg(first_seen="min", last_seen="max").reset_index()
+    required = {"sku_id", "month"}
+    missing = required - set(panel.columns)
 
+    if missing:
+        raise ValueError(
+            f"panel is missing required columns: {missing}"
+        )
 
-def build_full_panel(panel, active_windows):
+    return panel.groupby("sku_id")["month"].agg(first_seen="min",last_seen="max",).reset_index()
+
+    
+# def build_full_panel(panel, active_windows):
+#     """
+#     Reindex each SKU onto its OWN [first_seen, last_seen] window, filling any
+#     gap with zero.
+
+#     Deliberately per-SKU, not the global calendar. Reindexing to the full
+#     dataset range (as get_bare_sku_df below used to) fabricates years of
+#     zero-demand rows for any SKU that launches partway through the dataset,
+#     which biases both training data and downstream WMAPE.
+#     """
+#     full_index = pd.concat([
+#         pd.DataFrame({
+#             "sku_id": row.sku_id,
+#             "month": pd.date_range(row.first_seen, row.last_seen, freq="MS"),
+#         })
+#         for row in active_windows.itertuples()
+#     ], ignore_index=True)
+#     full = full_index.merge(panel, on=["sku_id", "month"], how="left")
+#     full["demand"] = full["demand"].fillna(0)
+#     return full.sort_values(["sku_id", "month"]).reset_index(drop=True)
+
+def build_full_panel(panel, active_windows, fill_internal_gaps=False):
     """
     Reindex each SKU onto its OWN [first_seen, last_seen] window, filling any
     gap with zero.
 
-    Deliberately per-SKU, not the global calendar. Reindexing to the full
-    dataset range (as get_bare_sku_df below used to) fabricates years of
-    zero-demand rows for any SKU that launches partway through the dataset,
-    which biases both training data and downstream WMAPE.
+    Deliberately per-SKU, not the global calendar.
+    
+    Validate and, only when explicitly requested, complete each SKU's
+    observed first-row-to-last-row monthly sequence.
+
+    By default, this function raises an error if internal SKU-month rows
+    are missing. It does not silently interpret missing records as
+    zero invoiced sales.
+
+    For the current Chile Suzuki collision data, no rows should be added.
     """
-    full_index = pd.concat([
-        pd.DataFrame({
-            "sku_id": row.sku_id,
-            "month": pd.date_range(row.first_seen, row.last_seen, freq="MS"),
-        })
-        for row in active_windows.itertuples()
-    ], ignore_index=True)
-    full = full_index.merge(panel, on=["sku_id", "month"], how="left")
-    full["demand"] = full["demand"].fillna(0)
+    required_panel = {"sku_id","month","demand"}
+    
+    missing_panel = required_panel - set(panel.columns)
+
+    if missing_panel:
+        raise ValueError(
+            f"panel is missing required columns: "
+            f"{missing_panel}"
+        )
+
+    required_windows = { "sku_id", "first_seen", "last_seen"}
+    
+    missing_windows = required_windows - set(active_windows.columns)
+    
+
+    if missing_windows:
+        raise ValueError(
+            f"active_windows is missing required columns: "
+            f"{missing_windows}"
+        )
+
+    if panel.duplicated(["sku_id", "month"]).any():
+        raise ValueError("panel contains duplicate SKU-month rows.")
+
+    full_index = pd.concat(
+        [
+            pd.DataFrame(
+                {
+                    "sku_id": row.sku_id,
+                    "month": pd.date_range(
+                        row.first_seen,
+                        row.last_seen,
+                        freq="MS",
+                    ),
+                }
+            )
+            for row in active_windows.itertuples()
+        ],
+        ignore_index=True,
+    )
+
+    full = full_index.merge(
+        panel,
+        on=["sku_id", "month"],
+        how="left",
+        validate="one_to_one",
+        indicator=True,
+    )
+
+    added_mask = full["_merge"] == "left_only"
+    n_rows_added = int(added_mask.sum())
+
+    if n_rows_added > 0 and not fill_internal_gaps:
+        examples = (
+            full.loc[
+                added_mask,
+                ["sku_id", "month"],
+            ]
+            .head(20)
+        )
+
+        display(examples)
+
+        raise ValueError(
+            f"Found {n_rows_added:,} missing internal "
+            f"SKU-month rows. These have not been filled "
+            f"because fill_internal_gaps=False."
+        )
+
+    if n_rows_added > 0:
+        full.loc[
+            added_mask,
+            "demand",
+        ] = 0.0
+
+        print(
+            f"Explicitly filled {n_rows_added:,} "
+            f"internal SKU-month gaps with zero."
+        )
+
+    full = full.drop(columns="_merge")
+
+    if full["demand"].isna().any():
+        raise ValueError(
+            "The completed panel still contains missing "
+            "demand values."
+        )
+
     return full.sort_values(["sku_id", "month"]).reset_index(drop=True)
+
+def skus_observed_by(
+    active_windows: pd.DataFrame,
+    month: pd.Timestamp,
+) -> set:
+    """
+    SKUs whose first observed row is no later than month.
+
+    This is based only on information contained in the supplied demand
+    extract. It does not claim that first_seen is the product launch date.
+    """
+    month = (
+        pd.Timestamp(month)
+        .to_period("M")
+        .to_timestamp()
+    )
+
+    return set(
+        active_windows.loc[
+            active_windows["first_seen"] <= month,
+            "sku_id",
+        ]
+    )
+
+
+def define_scoring_universe(active_windows: pd.DataFrame, origin: pd.Timestamp, target_date: pd.Timestamp,
+                            scoring_policy: str,):
+    """
+    Define eligibility before examining model predictions.
+
+    Policies
+    --------
+    known_at_origin:
+        Score only SKUs that had appeared in the supplied demand history
+        by the forecast origin.
+
+    all_observed_by_target:
+        Score every SKU that had appeared by the target month. SKUs first
+        observed after the origin require an explicit cold-start rule.
+    """
+    known_at_origin = skus_observed_by(active_windows,origin,)
+
+    observed_by_target = skus_observed_by(active_windows,target_date,)
+
+    post_origin_first_sale_skus = observed_by_target - known_at_origin
+    
+
+    if scoring_policy == "known_at_origin":
+        scored_skus = known_at_origin
+    elif scoring_policy == "all_observed_by_target":
+        scored_skus = observed_by_target
+    else:
+        raise ValueError(
+            "scoring_policy must be either "
+            "'known_at_origin' or "
+            "'all_observed_by_target'."
+        )
+
+    return {
+        "scored_skus": scored_skus,
+        "known_at_origin": known_at_origin,
+        "observed_by_target": observed_by_target,
+        "post_origin_first_sale_skus": post_origin_first_sale_skus
+    }
 
 
 def load_collision_backtest_data():
@@ -346,6 +541,48 @@ def train_frame(full_panel: pd.DataFrame, origin: pd.Timestamp, window_months: i
     return tf
 
 
+# def expanding_window_folds(
+#     full_panel: pd.DataFrame,
+#     active_windows: pd.DataFrame,
+#     min_train_months: int = 12,
+#     lag: int = LAG_MONTHS,
+#     horizon: int = HORIZON,
+#     window_months: int | None = None,
+# ):
+#     """
+#     Rolling-origin, expanding-window fold generator -- same fixed 3-month lag
+#     and 18-month horizon as before, but built on the corrected panel:
+#     train_df is dense within each SKU's own active window (no fabricated
+#     pre-launch/post-discontinuation zeros), and test_df is restricted HERE,
+#     at generation time, to SKUs genuinely active at target_date -- rather
+#     than being filtered later inside the scorer.
+#     """
+#     all_months = pd.date_range(full_panel["month"].min(), full_panel["month"].max(), freq="MS")
+#     first_origin_idx = min_train_months - 1
+#     last_origin_idx = len(all_months) - 1 - lag
+#     if last_origin_idx < first_origin_idx:
+#         raise ValueError(f"Not enough months ({len(all_months)}) for min_train_months={min_train_months} and lag={lag}.")
+
+#     for origin_idx in range(first_origin_idx, last_origin_idx + 1):
+#         origin = all_months[origin_idx]
+#         target_date = all_months[origin_idx + lag]
+
+#         train_df = train_frame(full_panel, origin, window_months=window_months)
+
+#         horizon_end_idx = min(origin_idx + horizon, len(all_months) - 1)
+#         horizon_dates = all_months[origin_idx + 1: horizon_end_idx + 1]
+
+#         scored_skus = active_skus_at(active_windows, target_date)
+#         test_df = full_panel.loc[
+#             (full_panel["month"] == target_date) & (full_panel["sku_id"].isin(scored_skus))
+#         ].copy()
+
+#         yield {"origin": origin, 
+#                "target_date": target_date, 
+#                "horizon_dates": horizon_dates,
+#                "train_df": train_df, 
+#                "test_df": test_df}
+
 def expanding_window_folds(
     full_panel: pd.DataFrame,
     active_windows: pd.DataFrame,
@@ -353,20 +590,39 @@ def expanding_window_folds(
     lag: int = LAG_MONTHS,
     horizon: int = HORIZON,
     window_months: int | None = None,
+    scoring_policy: str = "known_at_origin",
 ):
     """
-    Rolling-origin, expanding-window fold generator -- same fixed 3-month lag
-    and 18-month horizon as before, but built on the corrected panel:
-    train_df is dense within each SKU's own active window (no fabricated
-    pre-launch/post-discontinuation zeros), and test_df is restricted HERE,
-    at generation time, to SKUs genuinely active at target_date -- rather
-    than being filtered later inside the scorer.
+    Rolling-origin fold generator.
+
+    Eligibility is defined before the forecasting model is run.
+
+    scoring_policy='known_at_origin':
+        Score SKUs observed by the forecast origin.
+
+    scoring_policy='all_observed_by_target':
+        Also score SKUs first observed between origin and target. These
+        require an explicit cold-start forecast rule in the scorer.
     """
-    all_months = pd.date_range(full_panel["month"].min(), full_panel["month"].max(), freq="MS")
+    all_months = pd.date_range(
+        full_panel["month"].min(),
+        full_panel["month"].max(),
+        freq="MS",
+    )
+
     first_origin_idx = min_train_months - 1
-    last_origin_idx = len(all_months) - 1 - lag
+    last_origin_idx = (
+        len(all_months)
+        - 1
+        - lag
+    )
+
     if last_origin_idx < first_origin_idx:
-        raise ValueError(f"Not enough months ({len(all_months)}) for min_train_months={min_train_months} and lag={lag}.")
+        raise ValueError(
+            f"Not enough months ({len(all_months)}) "
+            f"for min_train_months={min_train_months} "
+            f"and lag={lag}."
+        )
 
     for origin_idx in range(first_origin_idx, last_origin_idx + 1):
         origin = all_months[origin_idx]
@@ -374,19 +630,65 @@ def expanding_window_folds(
 
         train_df = train_frame(full_panel, origin, window_months=window_months)
 
-        horizon_end_idx = min(origin_idx + horizon, len(all_months) - 1)
+        horizon_end_idx = min(origin_idx + horizon,len(all_months) - 1)
+
         horizon_dates = all_months[origin_idx + 1: horizon_end_idx + 1]
 
-        scored_skus = active_skus_at(active_windows, target_date)
-        test_df = full_panel.loc[
-            (full_panel["month"] == target_date) & (full_panel["sku_id"].isin(scored_skus))
-        ].copy()
+        universe = define_scoring_universe(active_windows, origin,target_date,scoring_policy=scoring_policy,)
 
-        yield {"origin": origin, 
-               "target_date": target_date, 
-               "horizon_dates": horizon_dates,
-               "train_df": train_df, 
-               "test_df": test_df}
+        scored_skus = universe["scored_skus"]
+
+        target_actuals = (
+            full_panel.loc[
+                full_panel["month"] == target_date,
+                [
+                    "sku_id",
+                    "month",
+                    "demand",
+                ],
+            ]
+            .copy()
+        )
+
+        test_df = (
+            pd.DataFrame({"sku_id": sorted(scored_skus)})
+            .merge(
+                target_actuals,
+                on="sku_id",
+                how="left",
+                validate="one_to_one",
+            )
+        )
+
+        missing_actuals = test_df["demand"].isna()
+
+        if missing_actuals.any():
+            examples = test_df.loc[missing_actuals,["sku_id"]].head(20)
+
+            display(examples)
+
+            raise ValueError(
+                f"{missing_actuals.sum():,} eligible "
+                f"SKUs do not have a target actual row "
+                f"for {target_date:%Y-%m}."
+            )
+
+        yield {
+            "origin": origin,
+            "target_date": target_date,
+            "horizon_dates": horizon_dates,
+            "train_df": train_df,
+            "test_df": test_df,
+            "scoring_policy": scoring_policy,
+            "known_at_origin": (
+                universe["known_at_origin"]
+            ),
+            "post_origin_first_sale_skus": (
+                universe[
+                    "post_origin_first_sale_skus"
+                ]
+            ),
+        }
 
 
 def validate_forecast_fn(forecast_fn, **kwargs):
@@ -452,70 +754,475 @@ ForecastFn = Callable[..., pd.DataFrame]
     belongs inside whichever forecast_fn needs it, not as a harness default
     every model is forced through.
 """
-def _joined_fold(fold, preds):
-    """The per-SKU joined table for one fold: sku_id, demand, y_pred, plus
-    which origin/target_date it came from. Excludes SKUs the model couldn't
-    forecast (see n_skus_excluded_new). Shared by _score_fold (which reduces
-    this to sums) and collect_predictions (which keeps it raw for plotting)."""
+# def _joined_fold(fold, preds):
+#     """The per-SKU joined table for one fold: sku_id, demand, y_pred, plus
+#     which origin/target_date it came from. Excludes SKUs the model couldn't
+#     forecast (see n_skus_excluded_new). Shared by _score_fold (which reduces
+#     this to sums) and collect_predictions (which keeps it raw for plotting)."""
+#     target_date = fold["target_date"]
+#     target_preds = preds.loc[preds["month"] == target_date, ["sku_id", "y_pred"]].copy()
+#     merged = fold["test_df"][["sku_id", "demand"]].merge(target_preds, on="sku_id", how="left")
+#     missing_forecast = merged["y_pred"].isna()
+#     n_skus_excluded_new = int(missing_forecast.sum())
+#     merged = merged[~missing_forecast].copy()
+#     merged["origin"] = fold["origin"]
+#     merged["target_date"] = target_date
+#     return merged, n_skus_excluded_new
+
+def _joined_fold(
+    fold,
+    preds,
+    cold_start_strategy="error",
+):
+    """
+    Join one fold's eligible actuals to its target predictions.
+
+    Missing predictions for SKUs known at the forecast origin are always
+    errors.
+
+    For post-origin first-sale SKUs:
+    - cold_start_strategy='zero' assigns an explicit zero forecast;
+    - cold_start_strategy='error' raises an error.
+
+    No prediction is silently dropped.
+    """
+    required = {
+        "sku_id",
+        "month",
+        "y_pred",
+    }
+    missing_columns = required - set(
+        preds.columns
+    )
+
+    if missing_columns:
+        raise ValueError(
+            f"Forecast output is missing columns: "
+            f"{missing_columns}"
+        )
+
     target_date = fold["target_date"]
-    target_preds = preds.loc[preds["month"] == target_date, ["sku_id", "y_pred"]].copy()
-    merged = fold["test_df"][["sku_id", "demand"]].merge(target_preds, on="sku_id", how="left")
-    missing_forecast = merged["y_pred"].isna()
-    n_skus_excluded_new = int(missing_forecast.sum())
-    merged = merged[~missing_forecast].copy()
+
+    target_preds = (
+        preds.loc[
+            preds["month"] == target_date,
+            [
+                "sku_id",
+                "y_pred",
+            ],
+        ]
+        .copy()
+    )
+
+    duplicate_mask = (
+        target_preds["sku_id"]
+        .duplicated(keep=False)
+    )
+
+    if duplicate_mask.any():
+        examples = (
+            target_preds.loc[
+                duplicate_mask
+            ]
+            .sort_values("sku_id")
+            .head(20)
+        )
+
+        display(examples)
+
+        raise ValueError(
+            f"Found {duplicate_mask.sum():,} "
+            f"duplicate prediction rows for "
+            f"{target_date:%Y-%m}."
+        )
+
+    invalid_forecast_mask = (
+        target_preds["y_pred"].isna()
+        | ~np.isfinite(
+            target_preds["y_pred"]
+        )
+    )
+
+    if invalid_forecast_mask.any():
+        examples = (
+            target_preds.loc[
+                invalid_forecast_mask
+            ]
+            .head(20)
+        )
+
+        display(examples)
+
+        raise ValueError(
+            f"Found {invalid_forecast_mask.sum():,} "
+            f"NaN or infinite forecasts for "
+            f"{target_date:%Y-%m}."
+        )
+
+    expected_skus = set(
+        fold["test_df"]["sku_id"]
+    )
+
+    predicted_skus = set(
+        target_preds["sku_id"]
+    )
+
+    known_at_origin = set(
+        fold["known_at_origin"]
+    )
+
+    post_origin_first_sale_skus = set(
+        fold["post_origin_first_sale_skus"]
+    )
+
+    missing_skus = (
+        expected_skus
+        - predicted_skus
+    )
+
+    missing_known_skus = (
+        missing_skus
+        & known_at_origin
+    )
+
+    missing_post_origin_skus = (
+        missing_skus
+        & post_origin_first_sale_skus
+    )
+
+    unexplained_missing_skus = (
+        missing_skus
+        - missing_known_skus
+        - missing_post_origin_skus
+    )
+
+    if missing_known_skus:
+        raise ValueError(
+            f"Model failed to forecast "
+            f"{len(missing_known_skus):,} SKUs "
+            f"that were known at the forecast origin "
+            f"{fold['origin']:%Y-%m}."
+        )
+
+    if unexplained_missing_skus:
+        raise ValueError(
+            f"{len(unexplained_missing_skus):,} "
+            f"eligible SKUs have unexplained missing "
+            f"predictions."
+        )
+
+    n_cold_start_skus_defaulted = 0
+
+    if missing_post_origin_skus:
+        if cold_start_strategy == "zero":
+            cold_start_predictions = pd.DataFrame(
+                {
+                    "sku_id": sorted(
+                        missing_post_origin_skus
+                    ),
+                    "y_pred": 0.0,
+                }
+            )
+
+            target_preds = pd.concat(
+                [
+                    target_preds,
+                    cold_start_predictions,
+                ],
+                ignore_index=True,
+            )
+
+            n_cold_start_skus_defaulted = len(
+                missing_post_origin_skus
+            )
+
+        elif cold_start_strategy == "error":
+            raise ValueError(
+                f"{len(missing_post_origin_skus):,} "
+                f"post-origin first-sale SKUs require "
+                f"an explicit cold-start strategy."
+            )
+
+        else:
+            raise ValueError(
+                "cold_start_strategy must be "
+                "'zero' or 'error'."
+            )
+
+    unexpected_prediction_skus = (
+        set(target_preds["sku_id"])
+        - expected_skus
+    )
+
+    if unexpected_prediction_skus:
+        raise ValueError(
+            f"The model produced target predictions "
+            f"for {len(unexpected_prediction_skus):,} "
+            f"SKUs outside the scoring universe."
+        )
+
+    merged = (
+        fold["test_df"][
+            [
+                "sku_id",
+                "demand",
+            ]
+        ]
+        .merge(
+            target_preds,
+            on="sku_id",
+            how="left",
+            validate="one_to_one",
+        )
+    )
+
+    if merged["y_pred"].isna().any():
+        raise AssertionError(
+            "Strict forecast join completed with "
+            "missing predictions."
+        )
+
+    if len(merged) != len(expected_skus):
+        raise AssertionError(
+            "Strict forecast join changed the number "
+            "of eligible SKUs."
+        )
+
     merged["origin"] = fold["origin"]
     merged["target_date"] = target_date
-    return merged, n_skus_excluded_new
-    
-def _score_fold(fold: Dict[str, Any], preds: pd.DataFrame):
-    """Turn one fold's forecast into a row of atomic sums.
 
-    fold["test_df"] is already restricted to SKUs active at target_date. A SKU
-    active at target but absent from preds launched inside the lag window --
-    the model had no history to forecast it from -- so it's excluded from
-    WMAPE and counted in n_skus_excluded_new, never silently zero-filled.
+    coverage = {
+        "n_expected_skus": len(
+            expected_skus
+        ),
+        "n_post_origin_first_sale_skus": len(
+            post_origin_first_sale_skus
+        ),
+        "n_cold_start_skus_defaulted": (
+            n_cold_start_skus_defaulted
+        ),
+        "n_post_origin_first_sale_skus_not_scored": (
+            len(post_origin_first_sale_skus)
+            if (
+                fold["scoring_policy"]
+                == "known_at_origin"
+            )
+            else 0
+        ),
+    }
+
+    return merged, coverage
+    
+# def _score_fold(fold: Dict[str, Any], preds: pd.DataFrame):
+#     """Turn one fold's forecast into a row of atomic sums.
+
+#     fold["test_df"] is already restricted to SKUs active at target_date. A SKU
+#     active at target but absent from preds launched inside the lag window --
+#     the model had no history to forecast it from -- so it's excluded from
+#     WMAPE and counted in n_skus_excluded_new, never silently zero-filled.
+#     """
+#     merged, n_skus_excluded_new = _joined_fold(fold, preds)
+#     err = merged["demand"] - merged["y_pred"]
+#     abs_actual_sum = float(merged["demand"].abs().sum())
+
+#     return {
+#         "origin": fold["origin"],
+#         "target_date": fold["target_date"],
+#         "n_skus": int(len(merged)),
+#         "n_skus_excluded_new": n_skus_excluded_new,
+#         "abs_error_sum": float(err.abs().sum()),
+#         "abs_actual_sum": abs_actual_sum,
+#         "error_sum": float(err.sum()),
+#         "wmape": wmape(merged["demand"], merged["y_pred"]),
+#     }
+
+def _score_fold(fold, preds, cold_start_strategy="error"):
     """
-    merged, n_skus_excluded_new = _joined_fold(fold, preds)
-    err = merged["demand"] - merged["y_pred"]
-    abs_actual_sum = float(merged["demand"].abs().sum())
+    Reduce one strictly validated fold to atomic WMAPE components.
+    """
+    merged, coverage = _joined_fold(
+        fold,
+        preds,
+        cold_start_strategy=(
+            cold_start_strategy
+        ),
+    )
+
+    err = (
+        merged["demand"]
+        - merged["y_pred"]
+    )
+
+    abs_actual_sum = float(
+        merged["demand"].abs().sum()
+    )
 
     return {
         "origin": fold["origin"],
         "target_date": fold["target_date"],
+        "scoring_policy": (
+            fold["scoring_policy"]
+        ),
         "n_skus": int(len(merged)),
-        "n_skus_excluded_new": n_skus_excluded_new,
-        "abs_error_sum": float(err.abs().sum()),
-        "abs_actual_sum": abs_actual_sum,
-        "error_sum": float(err.sum()),
-        "wmape": wmape(merged["demand"], merged["y_pred"]),
+        **coverage,
+        "abs_error_sum": float(
+            err.abs().sum()
+        ),
+        "abs_actual_sum": (
+            abs_actual_sum
+        ),
+        "error_sum": float(
+            err.sum()
+        ),
+        "wmape": wmape(
+            merged["demand"],
+            merged["y_pred"],
+        ),
     }
     
-def _score_fold_segments(fold, preds, sku_segment, segment_col="sb_class"):
-    """Same join as _score_fold, grouped by segment_col before summing.
-    Tracks n_skus_excluded_new PER SEGMENT, since exclusion rates can differ
-    meaningfully by segment."""
-    target_date = fold["target_date"]
-    target_preds = preds.loc[preds["month"] == target_date, ["sku_id", "y_pred"]].copy()
+# def _score_fold_segments(fold, preds, sku_segment, segment_col="sb_class"):
+#     """Same join as _score_fold, grouped by segment_col before summing.
+#     Tracks n_skus_excluded_new PER SEGMENT, since exclusion rates can differ
+#     meaningfully by segment."""
+#     target_date = fold["target_date"]
+#     target_preds = preds.loc[preds["month"] == target_date, ["sku_id", "y_pred"]].copy()
 
-    merged = (fold["test_df"][["sku_id", "demand"]]
-              .merge(target_preds, on="sku_id", how="left")
-              .merge(sku_segment[["sku_id", segment_col]], on="sku_id", how="left"))
+#     merged = (fold["test_df"][["sku_id", "demand"]]
+#               .merge(target_preds, on="sku_id", how="left")
+#               .merge(sku_segment[["sku_id", segment_col]], on="sku_id", how="left"))
 
-    missing_forecast = merged["y_pred"].isna()
-    excluded_counts = merged.loc[missing_forecast].groupby(segment_col).size().rename("n_skus_excluded_new")
+#     missing_forecast = merged["y_pred"].isna()
+#     excluded_counts = merged.loc[missing_forecast].groupby(segment_col).size().rename("n_skus_excluded_new")
 
-    merged = merged[~missing_forecast].copy()
-    merged["abs_error"] = (merged["demand"] - merged["y_pred"]).abs()
+#     merged = merged[~missing_forecast].copy()
+#     merged["abs_error"] = (merged["demand"] - merged["y_pred"]).abs()
 
-    out = merged.groupby(segment_col).agg(
-        abs_error_sum=("abs_error", "sum"),
-        abs_actual_sum=("demand", lambda s: s.abs().sum()),
-        n_skus=("sku_id", "count"),
-    ).reset_index()
-    out = out.merge(excluded_counts, on=segment_col, how="left")
-    out["n_skus_excluded_new"] = out["n_skus_excluded_new"].fillna(0).astype(int)
+#     out = merged.groupby(segment_col).agg(
+#         abs_error_sum=("abs_error", "sum"),
+#         abs_actual_sum=("demand", lambda s: s.abs().sum()),
+#         n_skus=("sku_id", "count"),
+#     ).reset_index()
+#     out = out.merge(excluded_counts, on=segment_col, how="left")
+#     out["n_skus_excluded_new"] = out["n_skus_excluded_new"].fillna(0).astype(int)
+#     out["origin"] = fold["origin"]
+#     out["target_date"] = target_date
+#     return out
+
+def _score_fold_segments(
+    fold,
+    preds,
+    sku_segment,
+    segment_col="sb_class",
+    cold_start_strategy="error",
+):
+    """
+    Strict fold scoring split by segment.
+
+    Post-origin first-sale SKUs with no historical segment are assigned
+    the explicit segment 'ColdStart' when zero-defaulted.
+    """
+    merged, coverage = _joined_fold(
+        fold,
+        preds,
+        cold_start_strategy=(
+            cold_start_strategy
+        ),
+    )
+
+    segment_lookup = (
+        sku_segment[
+            [
+                "sku_id",
+                segment_col,
+            ]
+        ]
+        .drop_duplicates("sku_id")
+    )
+
+    merged = merged.merge(
+        segment_lookup,
+        on="sku_id",
+        how="left",
+        validate="many_to_one",
+    )
+
+    missing_segment_mask = (
+        merged[segment_col].isna()
+    )
+
+    if missing_segment_mask.any():
+        post_origin_mask = (
+            merged["sku_id"].isin(
+                fold[
+                    "post_origin_first_sale_skus"
+                ]
+            )
+        )
+
+        cold_start_segment_mask = (
+            missing_segment_mask
+            & post_origin_mask
+        )
+
+        merged.loc[
+            cold_start_segment_mask,
+            segment_col,
+        ] = "ColdStart"
+
+        remaining_missing = (
+            merged[segment_col].isna()
+        )
+
+        if remaining_missing.any():
+            raise ValueError(
+                f"{remaining_missing.sum():,} "
+                f"known SKUs are missing "
+                f"{segment_col} labels."
+            )
+
+    merged["abs_error"] = (
+        merged["demand"]
+        - merged["y_pred"]
+    ).abs()
+
+    out = (
+        merged.groupby(
+            segment_col,
+            as_index=False,
+        )
+        .agg(
+            abs_error_sum=(
+                "abs_error",
+                "sum",
+            ),
+            abs_actual_sum=(
+                "demand",
+                lambda s: s.abs().sum(),
+            ),
+            n_skus=(
+                "sku_id",
+                "count",
+            ),
+        )
+    )
+
+    out["wmape"] = np.where(
+        out["abs_actual_sum"] > 0,
+        (
+            out["abs_error_sum"]
+            / out["abs_actual_sum"]
+        ),
+        np.nan,
+    )
+
     out["origin"] = fold["origin"]
-    out["target_date"] = target_date
+    out["target_date"] = (
+        fold["target_date"]
+    )
+    out["scoring_policy"] = (
+        fold["scoring_policy"]
+    )
+
     return out
 
 
@@ -595,60 +1302,246 @@ def _score_fold_segments(fold, preds, sku_segment, segment_col="sb_class"):
 #     return results_df
 
 
-#Edwin: 10th July - merged segmentation into run_backtest
-def run_backtest(forecast_fn, full_panel, 
-                active_windows, params=None, min_train_months=12,
-                on_fold_complete=None, collect_predictions=False, verbose=False,
-                sku_segment=None, segment_col="sb_class"):
-    """
-    If sku_segment is None (default): one row per fold, pooled across all
-    scored SKUs -- exactly what this function always returned.
+# #Edwin: 10th July - merged segmentation into run_backtest
+# def run_backtest(forecast_fn, full_panel, 
+#                 active_windows, params=None, min_train_months=12,
+#                 on_fold_complete=None, collect_predictions=False, verbose=False,
+#                 sku_segment=None, segment_col="sb_class"):
+#     """
+#     If sku_segment is None (default): one row per fold, pooled across all
+#     scored SKUs -- exactly what this function always returned.
 
-    If sku_segment is given: one row per (fold, segment) instead. Calling
-    pooled_wmape(results) with no `by` still gives the correct overall
-    pooled number in this case, since segments are disjoint and their sums
-    reconstruct the total exactly (see the share-weighted identity). There
-    is deliberately no separate 'ALL' row mixed in alongside the segment
-    rows -- that would double-count every SKU-month's error.
+#     If sku_segment is given: one row per (fold, segment) instead. Calling
+#     pooled_wmape(results) with no `by` still gives the correct overall
+#     pooled number in this case, since segments are disjoint and their sums
+#     reconstruct the total exactly (see the share-weighted identity). There
+#     is deliberately no separate 'ALL' row mixed in alongside the segment
+#     rows -- that would double-count every SKU-month's error.
+#     """
+#     params = params or {}
+#     rows = []
+#     prediction_rows = [] if collect_predictions else None
+#     run_abs_err = run_abs_act = 0.0
+
+#     for fold_idx, fold in enumerate(expanding_window_folds(full_panel, active_windows, min_train_months=min_train_months)):
+#         preds = forecast_fn(fold["train_df"], horizon=len(fold["horizon_dates"]), **params)
+
+#         if sku_segment is None:
+#             row = _score_fold(fold, preds)
+#             rows.append(row)
+#             fold_abs_err, fold_abs_act = row["abs_error_sum"], row["abs_actual_sum"]
+#         else:
+#             seg_df = _score_fold_segments(fold, preds, sku_segment, segment_col=segment_col)
+#             rows.extend(seg_df.to_dict("records"))
+#             fold_abs_err, fold_abs_act = seg_df["abs_error_sum"].sum(), seg_df["abs_actual_sum"].sum()
+
+#         if collect_predictions:
+#             merged, _ = _joined_fold(fold, preds)
+#             merged["abs_error"] = (merged["demand"] - merged["y_pred"]).abs()
+#             if sku_segment is not None:
+#                 merged = merged.merge(sku_segment, on="sku_id", how="left")
+#             prediction_rows.append(merged)
+
+#         run_abs_err += fold_abs_err
+#         run_abs_act += fold_abs_act
+#         if verbose:
+#             wmape_this_fold = fold_abs_err / fold_abs_act if fold_abs_act > 0 else float("nan")
+#             print(f"fold {fold_idx+1:>2}  origin={fold['origin']:%Y-%m}  target={fold['target_date']:%Y-%m}  wmape={wmape_this_fold:.4f}")
+#         if on_fold_complete is not None:
+#             running_pooled = run_abs_err / run_abs_act if run_abs_act > 0 else float("nan")
+#             if on_fold_complete(fold_idx, running_pooled):
+#                 break
+
+#     results_df = pd.DataFrame(rows).sort_values("origin").reset_index(drop=True)
+#     if collect_predictions:
+#         predictions_df = pd.concat(prediction_rows, ignore_index=True).sort_values(["sku_id","origin"]).reset_index(drop=True)
+#         return results_df, predictions_df
+#     return results_df
+
+def run_backtest(
+    forecast_fn,
+    full_panel,
+    active_windows,
+    params=None,
+    min_train_months=12,
+    lag=LAG_MONTHS,
+    horizon=HORIZON,
+    window_months=None,
+    scoring_policy="known_at_origin",
+    cold_start_strategy="error",
+    on_fold_complete=None,
+    collect_predictions=False,
+    verbose=False,
+    sku_segment=None,
+    segment_col="sb_class",
+):
+    """
+    Run a strict rolling-origin backtest.
+
+    Eligibility is determined independently of forecast availability.
+    Every eligible SKU must receive a valid target prediction.
     """
     params = params or {}
-    rows = []
-    prediction_rows = [] if collect_predictions else None
-    run_abs_err = run_abs_act = 0.0
 
-    for fold_idx, fold in enumerate(expanding_window_folds(full_panel, active_windows, min_train_months=min_train_months)):
-        preds = forecast_fn(fold["train_df"], horizon=len(fold["horizon_dates"]), **params)
+    rows = []
+    prediction_rows = (
+        []
+        if collect_predictions
+        else None
+    )
+
+    run_abs_err = 0.0
+    run_abs_act = 0.0
+
+    folds = expanding_window_folds(
+        full_panel,
+        active_windows,
+        min_train_months=min_train_months,
+        lag=lag,
+        horizon=horizon,
+        window_months=window_months,
+        scoring_policy=scoring_policy,
+    )
+
+    for fold_idx, fold in enumerate(folds):
+        preds = forecast_fn(
+            fold["train_df"],
+            horizon=len(
+                fold["horizon_dates"]
+            ),
+            **params,
+        )
 
         if sku_segment is None:
-            row = _score_fold(fold, preds)
+            row = _score_fold(
+                fold,
+                preds,
+                cold_start_strategy=(
+                    cold_start_strategy
+                ),
+            )
+
             rows.append(row)
-            fold_abs_err, fold_abs_act = row["abs_error_sum"], row["abs_actual_sum"]
+
+            fold_abs_err = (
+                row["abs_error_sum"]
+            )
+            fold_abs_act = (
+                row["abs_actual_sum"]
+            )
+
         else:
-            seg_df = _score_fold_segments(fold, preds, sku_segment, segment_col=segment_col)
-            rows.extend(seg_df.to_dict("records"))
-            fold_abs_err, fold_abs_act = seg_df["abs_error_sum"].sum(), seg_df["abs_actual_sum"].sum()
+            seg_df = _score_fold_segments(
+                fold,
+                preds,
+                sku_segment,
+                segment_col=segment_col,
+                cold_start_strategy=(
+                    cold_start_strategy
+                ),
+            )
+
+            rows.extend(
+                seg_df.to_dict("records")
+            )
+
+            fold_abs_err = float(
+                seg_df[
+                    "abs_error_sum"
+                ].sum()
+            )
+            fold_abs_act = float(
+                seg_df[
+                    "abs_actual_sum"
+                ].sum()
+            )
 
         if collect_predictions:
-            merged, _ = _joined_fold(fold, preds)
-            merged["abs_error"] = (merged["demand"] - merged["y_pred"]).abs()
+            merged, _ = _joined_fold(
+                fold,
+                preds,
+                cold_start_strategy=(
+                    cold_start_strategy
+                ),
+            )
+
+            merged["abs_error"] = (
+                merged["demand"]
+                - merged["y_pred"]
+            ).abs()
+
             if sku_segment is not None:
-                merged = merged.merge(sku_segment, on="sku_id", how="left")
-            prediction_rows.append(merged)
+                merged = merged.merge(
+                    sku_segment,
+                    on="sku_id",
+                    how="left",
+                )
+
+            prediction_rows.append(
+                merged
+            )
 
         run_abs_err += fold_abs_err
         run_abs_act += fold_abs_act
+
         if verbose:
-            wmape_this_fold = fold_abs_err / fold_abs_act if fold_abs_act > 0 else float("nan")
-            print(f"fold {fold_idx+1:>2}  origin={fold['origin']:%Y-%m}  target={fold['target_date']:%Y-%m}  wmape={wmape_this_fold:.4f}")
+            wmape_this_fold = (
+                fold_abs_err / fold_abs_act
+                if fold_abs_act > 0
+                else float("nan")
+            )
+
+            print(
+                f"fold {fold_idx + 1:>2}  "
+                f"origin={fold['origin']:%Y-%m}  "
+                f"target={fold['target_date']:%Y-%m}  "
+                f"wmape={wmape_this_fold:.4f}"
+            )
+
         if on_fold_complete is not None:
-            running_pooled = run_abs_err / run_abs_act if run_abs_act > 0 else float("nan")
-            if on_fold_complete(fold_idx, running_pooled):
+            running_pooled = (
+                run_abs_err / run_abs_act
+                if run_abs_act > 0
+                else float("nan")
+            )
+
+            if on_fold_complete(
+                fold_idx,
+                running_pooled,
+            ):
                 break
 
-    results_df = pd.DataFrame(rows).sort_values("origin").reset_index(drop=True)
+    results_df = (
+        pd.DataFrame(rows)
+        .sort_values(
+            [
+                "origin",
+                "target_date",
+            ]
+        )
+        .reset_index(drop=True)
+    )
+
     if collect_predictions:
-        predictions_df = pd.concat(prediction_rows, ignore_index=True).sort_values(["sku_id","origin"]).reset_index(drop=True)
-        return results_df, predictions_df
+        predictions_df = (
+            pd.concat(
+                prediction_rows,
+                ignore_index=True,
+            )
+            .sort_values(
+                [
+                    "sku_id",
+                    "origin",
+                ]
+            )
+            .reset_index(drop=True)
+        )
+
+        return (
+            results_df,
+            predictions_df,
+        )
+
     return results_df
 
 
@@ -662,11 +1555,18 @@ def summarise_backtest(results_df, window=3, verbose=False):
 
     if verbose:
         print(f"folds: {len(results_df)}")
+        
     print(f"total pooled WMAPE (whole backtest): {total_pooled:.4f}")
     print(f"latest {window}-month rolling pooled WMAPE (covering {latest_origins}): {latest_rolling:.4f}")
-    if "n_skus_excluded_new" in results_df.columns and results_df["n_skus_excluded_new"].sum() > 0:
-        print(f"SKUs excluded (launched mid-lag-window): {results_df['n_skus_excluded_new'].sum()}")
-    return {"total_pooled": total_pooled, "latest_rolling": latest_rolling}
+    if ("n_post_origin_first_sale_skus_not_scored" in results_df.columns):
+        n_not_scored = int(results_df["n_post_origin_first_sale_skus_not_scored"].sum())
+
+        if n_not_scored > 0:
+            print("Post-origin first-sale SKU-fold "
+                f"cases not included in the selected "
+                f"scoring universe: {n_not_scored:,}")
+            
+        return {"total_pooled": total_pooled, "latest_rolling": latest_rolling}
 
 
 def quick_backtest(forecast_fn, params=None, min_train_months=12, verbose=False):
