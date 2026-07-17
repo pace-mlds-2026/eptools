@@ -1484,7 +1484,6 @@ def summarise_segments(full_panel, sku_segment, segment_col="sb_class"):
     return summary.sort_values("share_of_demand", ascending=False).reset_index(drop=True)
 
 
-import matplotlib.pyplot as plt
 def plot_sku_forecast_history(predictions_df, sku_id, full_panel=None, ax=None):
     """... same docstring, plus:
     ax : optional matplotlib Axes to draw into (e.g. one cell of a grid).
