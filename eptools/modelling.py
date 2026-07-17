@@ -3,6 +3,7 @@ import os
 import platform
 import string
 import pandas as pd
+import matplotlib.pyplot as plt
 
 
 _DATAFRAMES_CACHE: dict = {}
