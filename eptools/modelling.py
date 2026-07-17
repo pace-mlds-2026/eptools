@@ -304,6 +304,10 @@ def subset_panel(full_panel, active_windows, sku_ids):
             active_windows[active_windows["sku_id"].isin(sku_ids)].reset_index(drop=True))
 
 
+collision_sales = get_collision_sales_df()
+collision_sales.head()
+
+
 #Edwin: Moved here.
 # forecast protocol constants — fixed by the project spec. Moved here from
 # eptools.modelling since fold generation now lives in this module.
@@ -677,6 +681,30 @@ def quick_backtest(forecast_fn, params=None, min_train_months=12, verbose=False)
     return results
 
 
+def summarise_segments(full_panel, sku_segment, segment_col="sb_class"):
+    """
+    Per-segment summary: how many SKUs are in each group, and how much of
+    total demand volume they represent. These are NOT the same thing --
+    classify_sb only classifies, it doesn't tell you which groups actually
+    matter for WMAPE, since WMAPE is volume-weighted, not SKU-count-weighted.
+    share_of_demand here is exactly the share_s term from the pooled-WMAPE
+    identity (pooled = sum(share_s * wmape_s)) -- this is where those
+    weights actually come from.
+    """
+    total_demand_per_sku = full_panel.groupby("sku_id")["demand"].sum().rename("total_demand").reset_index()
+    merged = total_demand_per_sku.merge(sku_segment[["sku_id", segment_col]], on="sku_id", how="left")
+
+    summary = merged.groupby(segment_col).agg(
+        n_skus=("sku_id", "count"),
+        total_demand=("total_demand", "sum"),
+    ).reset_index()
+
+    summary["share_of_skus"] = summary["n_skus"] / summary["n_skus"].sum()
+    summary["share_of_demand"] = summary["total_demand"] / summary["total_demand"].sum()
+
+    return summary.sort_values("share_of_demand", ascending=False).reset_index(drop=True)
+
+
 import matplotlib.pyplot as plt
 def plot_sku_forecast_history(predictions_df, sku_id, full_panel=None, ax=None):
     """... same docstring, plus:
@@ -892,6 +920,173 @@ def illustrate_folds(forecast_fn, full_panel, active_windows, sku_ids, origins,
         print(f"  Fold {i}: origin={origin.date()}  target={target_date.date()}  WMAPE={row['wmape']:.4f}")
 
 
+# Same palette already used across the project's own plotting functions
+COLOR_MONTHLY = "#ccc"      # noisy monthly signal -- background context, same role as "full history"
+COLOR_ROLLING = "#2a78d6"   # the smoothed number that matters -- same blue used for "actual"
+
+def plot_wmape_over_time(
+    results_df,
+    window: int = 3,
+    title: str = "Naive baseline: pooled WMAPE through time",
+):
+    """
+    results_df: the *pooled* output of run_backtest — i.e. called WITHOUT
+    sku_segment, one row per fold. summarise_backtest() expects the same
+    shape, so anything you've already run through that function can go
+    straight into this one.
+
+    If you ran a segmented backtest instead (sku_segment=sb_lookup, one row
+    per fold+segment), collapse it back to one row per fold first:
+
+        pooled = (
+            segmented_results
+            .groupby(["origin", "target_date"], as_index=False)
+            [["abs_error_sum", "abs_actual_sum"]].sum()
+        )
+        pooled["wmape"] = pooled["abs_error_sum"] / pooled["abs_actual_sum"]
+
+    Segments are disjoint, so summing atomic sums first reconstructs the
+    pooled total exactly (same identity the leverage-argument slide uses).
+    Don't feed segmented rows straight into this function —
+    rolling_average_wmape assumes one row per fold, so a segmented frame
+    would roll over segment-rows instead of folds.
+    """
+    r = results_df.sort_values("origin").reset_index(drop=True)
+
+    fig, ax = plt.subplots(figsize=(11, 4.3))
+    ax.plot(
+        r["target_date"],
+        r["wmape"],
+        color=COLOR_MONTHLY,
+        linewidth=1.3,
+        marker="o",
+        markersize=3,
+        label="Monthly pooled WMAPE",
+    )
+    ax.plot(
+        r["target_date"],
+        rolling_average_wmape(r, window=window, method="pooled"),
+        color=COLOR_ROLLING,
+        linewidth=2.2,
+        label=f"{window}-month rolling pooled WMAPE",
+    )
+
+    ax.set_title(title)
+    ax.set_xlabel("Target month (scored)")
+    ax.set_ylabel("WMAPE")
+    ax.legend(fontsize=8)
+    fig.autofmt_xdate()
+    plt.tight_layout()
+
+    return fig
+
+
+
+# Same 4-colour palette illustrate_folds() uses for multi-series comparison,
+# assigned in descending share-of-demand order (Smooth largest -> Lumpy smallest)
+SEGMENT_COLORS = {
+    "Smooth": "#2a78d6",
+    "Erratic": "#e07b39",
+    "Intermittent": "#4caf50",
+    "Lumpy": "#9c27b0",
+}
+
+
+def plot_leverage_argument(
+    segmented_results,
+    segment_summary,
+    segment_col: str = "sb_class",
+    head_segments=("Smooth", "Erratic"),
+    tail_segments=("Intermittent", "Lumpy"),
+    cut: float = 0.10,
+    title: str = "The leverage argument: same effort, different payoff",
+):
+    """
+    segmented_results: output of
+        run_backtest(forecast_fn, full_panel, windows,
+                      sku_segment=sb_lookup, segment_col=segment_col)
+    -- one row per (fold, segment).
+
+    segment_summary: the DataFrame returned by
+        summarise_segments(full_panel, sb_lookup, segment_col=segment_col)
+    -- must contain [segment_col, "share_of_demand"].
+
+    Draws three stacked bars, each stacked by segment. Each segment's
+    slice height is share_of_demand * that segment's WMAPE -- literally one
+    term of the pooled-WMAPE identity -- so the total bar height is the
+    pooled WMAPE for that scenario, and the stack composition shows where
+    it's coming from:
+
+      1. Current  -- pooled WMAPE as actually backtested.
+      2. A `cut` (default 10 points) applied ONLY to head_segments.
+      3. The SAME `cut` applied ONLY to tail_segments.
+
+    Bars 2 and 3 use an identical cut size, so the height difference
+    between them is not an illustration of the leverage argument, it IS
+    the leverage argument -- same modelling effort, different payoff,
+    purely from where volume sits.
+    """
+    current = pooled_wmape(segmented_results, by=segment_col)
+    merged = current.merge(
+        segment_summary[[segment_col, "share_of_demand"]], on=segment_col
+    )
+    merged = merged[merged["share_of_demand"] > 0].reset_index(drop=True)
+
+    def contributions(wmape_cuts=None):
+        wmape = merged.set_index(segment_col)["pooled_wmape"].copy()
+        if wmape_cuts:
+            for seg, delta in wmape_cuts.items():
+                if seg in wmape.index:
+                    wmape[seg] = max(wmape[seg] - delta, 0.0)
+        share = merged.set_index(segment_col)["share_of_demand"]
+        return (share * wmape).rename("contribution")
+
+    scenario_labels = [
+        "Current\n(as backtested)",
+        f"-{int(cut*100)}pt cut:\nSmooth + Erratic",
+        f"-{int(cut*100)}pt cut:\nIntermittent + Lumpy",
+    ]
+
+    scenarios = {
+        scenario_labels[0]: contributions(),
+        scenario_labels[1]: contributions({s: cut for s in head_segments}),
+        scenario_labels[2]: contributions({s: cut for s in tail_segments}),
+    }
+
+    segment_order = merged.sort_values("share_of_demand", ascending=False)[segment_col].tolist()
+
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    x = range(len(scenarios))
+    bottoms = [0.0] * len(scenarios)
+
+    for seg in segment_order:
+        heights = [scenarios[label][seg] for label in scenarios]
+        ax.bar(
+            x,
+            heights,
+            bottom=bottoms,
+            label=seg,
+            color=SEGMENT_COLORS.get(seg, "#999999"),
+            width=0.55,
+        )
+        bottoms = [b + h for b, h in zip(bottoms, heights)]
+
+    for i, label in enumerate(scenarios):
+        total = float(scenarios[label].sum())
+        ax.text(i, total + 0.012, f"{total:.3f}", ha="center", va="bottom", fontweight="bold")
+
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(list(scenarios.keys()))
+    ax.set_ylabel("Pooled WMAPE\n(stacked: segment share of demand x segment WMAPE)")
+    ax.set_title(title)
+    ax.legend(title="SB class", fontsize=8)
+    plt.tight_layout()
+
+    return fig
+
+
+
+
 def classify_sb(panel: pd.DataFrame) -> pd.DataFrame:
     """Syntetos-Boylan classification. Pass full_panel for a retrospective,
     reporting-only label. Pass train_frame(full_panel, origin) for a
@@ -919,6 +1114,57 @@ def classify_sb(panel: pd.DataFrame) -> pd.DataFrame:
 
     stats["sb_class"] = stats.apply(label, axis=1)
     return stats[["sku_id", "adi", "cv2", "sb_class"]]
+
+
+def segment_scope(forecast_fn, allowed_classes, classify_fn=classify_sb, segment_col="sb_class"):
+    """
+    Wraps a plain forecast_fn(train_df, horizon, **kwargs) -> DataFrame so it
+    only ever sees and predicts for SKUs in allowed_classes, classified from
+    train_df itself -- so classification is automatically point-in-time,
+    since train_df is already cut off at the fold's origin by train_frame().
+
+    forecast_fn itself stays completely segment-agnostic; it never needs to
+    know classes exist.
+    """
+    allowed = set(allowed_classes)
+
+    def wrapped(train_df, horizon, **kwargs):
+        segment_lookup = classify_fn(train_df)  # e.g. DataFrame[sku_id, sb_class]
+        scoped_skus = segment_lookup.loc[
+            segment_lookup[segment_col].isin(allowed), "sku_id"
+        ]
+        scoped_train_df = train_df[train_df["sku_id"].isin(scoped_skus)]
+
+        if scoped_train_df.empty:
+            return pd.DataFrame(columns=["sku_id", "month", "y_pred"])
+
+        return forecast_fn(scoped_train_df, horizon, **kwargs)
+
+    wrapped.__name__ = f"{forecast_fn.__name__}__scoped_to_{'_'.join(sorted(allowed))}"
+    return wrapped
+
+
+def combine_segment_results(*results_dfs, on=("origin", "target_date")):
+    """
+    Combines disjoint, exhaustive run_backtest outputs (e.g. head-model
+    results + tail-model results) into one pooled results_df per fold.
+    Sums abs_error_sum/abs_actual_sum BEFORE dividing -- never averages the
+    separate wmape columns, since that would silently equal-weight the two
+    models regardless of how much volume each one actually scored.
+    """
+    combined = results_dfs[0][[*on, "abs_error_sum", "abs_actual_sum"]].copy()
+
+    for r in results_dfs[1:]:
+        combined = combined.merge(
+            r[[*on, "abs_error_sum", "abs_actual_sum"]],
+            on=list(on), suffixes=("", "_other"), how="outer",
+        )
+        combined["abs_error_sum"] = combined["abs_error_sum"].fillna(0) + combined["abs_error_sum_other"].fillna(0)
+        combined["abs_actual_sum"] = combined["abs_actual_sum"].fillna(0) + combined["abs_actual_sum_other"].fillna(0)
+        combined = combined.drop(columns=["abs_error_sum_other", "abs_actual_sum_other"])
+
+    combined["wmape"] = combined["abs_error_sum"] / combined["abs_actual_sum"]
+    return combined.sort_values(list(on)).reset_index(drop=True)
 
 
 # def _score_fold_segments(fold, preds, sku_segment: pd.DataFrame, segment_col: str = "sb_class") -> pd.DataFrame:
