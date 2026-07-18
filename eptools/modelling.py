@@ -2294,21 +2294,3 @@ def combine_segment_results(*results_dfs, on=("origin", "target_date")):
 #         preds = forecast_fn(fold["train_df"], horizon=len(fold["horizon_dates"]), **params)
 #         all_segs.append(_score_fold_segments(fold, preds, sku_segment, segment_col=segment_col))
 #     return pd.concat(all_segs, ignore_index=True)
-
-
-# NOTEBOOK ONLY
-naive_unscoped, _ = run_backtest(naive_moving_average, full_panel, windows, params={"window": 3},collect_predictions=True)
-
-naive_head, _ = run_backtest(naive_moving_average, full_panel, windows, params={"window": 3},collect_predictions=True,
-                              scope_fn=scope_to("Smooth", "Erratic"))
-naive_tail, _ = run_backtest(naive_moving_average, full_panel, windows, params={"window": 3},collect_predictions=True,
-                              scope_fn=scope_to("Intermittent", "Lumpy", "NoDemand"))
-
-naive_recombined = combine_segment_results(naive_head, naive_tail)
-
-pd.testing.assert_series_equal(
-    naive_unscoped.sort_values("origin")["wmape"].reset_index(drop=True),
-    naive_recombined.sort_values("origin")["wmape"].reset_index(drop=True),
-    check_exact=False, rtol=1e-9,
-)
-print("scoped + recombined matches unscoped exactly — safe to trust scoped runs.")
