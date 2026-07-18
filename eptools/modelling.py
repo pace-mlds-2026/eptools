@@ -2242,21 +2242,45 @@ def segment_scope(forecast_fn, allowed_classes, classify_fn=classify_sb, segment
     return wrapped
 
 
+# def combine_segment_results(*results_dfs, on=("origin", "target_date")):
+#     """
+#     Combines disjoint, exhaustive run_backtest outputs (e.g. head-model
+#     results + tail-model results) into one pooled results_df per fold.
+#     Sums abs_error_sum/abs_actual_sum BEFORE dividing -- never averages the
+#     separate wmape columns, since that would silently equal-weight the two
+#     models regardless of how much volume each one actually scored.
+#     """
+#     combined = results_dfs[0][[*on, "abs_error_sum", "abs_actual_sum"]].copy()
+
+#     for r in results_dfs[1:]:
+#         combined = combined.merge(
+#             r[[*on, "abs_error_sum", "abs_actual_sum"]],
+#             on=list(on), suffixes=("", "_other"), how="outer",
+#         )
+#         combined["abs_error_sum"] = combined["abs_error_sum"].fillna(0) + combined["abs_error_sum_other"].fillna(0)
+#         combined["abs_actual_sum"] = combined["abs_actual_sum"].fillna(0) + combined["abs_actual_sum_other"].fillna(0)
+#         combined = combined.drop(columns=["abs_error_sum_other", "abs_actual_sum_other"])
+
+#     combined["wmape"] = combined["abs_error_sum"] / combined["abs_actual_sum"]
+#     return combined.sort_values(list(on)).reset_index(drop=True)
+
 def combine_segment_results(*results_dfs, on=("origin", "target_date")):
     """
     Combines disjoint, exhaustive run_backtest outputs (e.g. head-model
     results + tail-model results) into one pooled results_df per fold.
-    Sums abs_error_sum/abs_actual_sum BEFORE dividing -- never averages the
-    separate wmape columns, since that would silently equal-weight the two
-    models regardless of how much volume each one actually scored.
-    """
-    combined = results_dfs[0][[*on, "abs_error_sum", "abs_actual_sum"]].copy()
 
+    Each input is first collapsed to exactly one row per fold by summing
+    atomic sums across any segment rows. No-op if the input already has
+    one row per fold (run_backtest called WITHOUT sku_segment=). Required
+    if it was called WITH sku_segment= (one row per fold+class instead).
+    """
+    def _collapse_to_one_row_per_fold(df):
+        return df.groupby(list(on), as_index=False)[["abs_error_sum", "abs_actual_sum"]].sum()
+
+    combined = _collapse_to_one_row_per_fold(results_dfs[0])
     for r in results_dfs[1:]:
-        combined = combined.merge(
-            r[[*on, "abs_error_sum", "abs_actual_sum"]],
-            on=list(on), suffixes=("", "_other"), how="outer",
-        )
+        r_collapsed = _collapse_to_one_row_per_fold(r)
+        combined = combined.merge(r_collapsed, on=list(on), suffixes=("", "_other"), how="outer")
         combined["abs_error_sum"] = combined["abs_error_sum"].fillna(0) + combined["abs_error_sum_other"].fillna(0)
         combined["abs_actual_sum"] = combined["abs_actual_sum"].fillna(0) + combined["abs_actual_sum_other"].fillna(0)
         combined = combined.drop(columns=["abs_error_sum_other", "abs_actual_sum_other"])
