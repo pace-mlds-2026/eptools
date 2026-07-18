@@ -591,6 +591,29 @@ def make_fold(
         "observed_by_target": universe["observed_by_target"],
         "post_origin_first_sale_skus": universe["post_origin_first_sale_skus"],
     }
+    
+def _apply_scope(fold, scope_fn):
+    """
+    Narrow a fold to a declared SKU scope, computed from that fold's own
+    train_df -- already sliced to <= origin by train_frame(), so this is
+    point-in-time by construction. classify_sb's own docstring says exactly
+    this: pass train_frame(full_panel, origin) for a routing-safe label,
+    never the full-panel version. scope_fn is how that rule gets enforced
+    automatically rather than relying on every model author remembering it.
+
+    The SAME scope decides what forecast_fn is allowed to see AND what the
+    scorer expects back -- one classification call per fold, not two, so
+    "what the model was given" and "what the scorer demands" can't drift
+    apart the way they would if each model wrapped its own filtering.
+    """
+    scoped_skus = scope_fn(fold["train_df"])
+    fold = dict(fold)  # shallow copy -- don't mutate the shared fold dict
+    fold["train_df"] = fold["train_df"][fold["train_df"]["sku_id"].isin(scoped_skus)]
+    fold["known_at_origin"] = fold["known_at_origin"] & scoped_skus
+    fold["post_origin_first_sale_skus"] = fold["post_origin_first_sale_skus"] & scoped_skus
+    fold["test_df"] = fold["test_df"][fold["test_df"]["sku_id"].isin(scoped_skus)]
+    return fold
+
 # def expanding_window_folds(
 #     full_panel: pd.DataFrame,
 #     active_windows: pd.DataFrame,
@@ -1251,9 +1274,11 @@ def run_backtest(
     cold_start_strategy="error",
     on_fold_complete=None,
     collect_predictions=False,
-    verbose=False,
+    scope_fn=None,              # NEW -- restricts which SKUs the model sees/is scored on.
+                                  # None (default) = no change to current behaviour.
     sku_segment=None,
     segment_col="sb_class",
+    verbose=False,
 ):
     """
     Run a strict rolling-origin backtest.
@@ -1284,6 +1309,9 @@ def run_backtest(
     )
 
     for fold_idx, fold in enumerate(folds):
+        if scope_fn is not None:
+            fold = _apply_scope(fold, scope_fn)          # <-- NEW, only line added here
+
         preds = forecast_fn(
             fold["train_df"],
             horizon=len(
@@ -2147,6 +2175,45 @@ def classify_sb(panel: pd.DataFrame) -> pd.DataFrame:
     return stats[["sku_id", "adi", "cv2", "sb_class"]]
 
 
+def scope_to(*allowed_classes, classify_fn=classify_sb, segment_col="sb_class"):
+    """
+    Builds a scope_fn for run_backtest(scope_fn=...). Classification happens
+    inside, on whatever train_df it's given each fold -- so it inherits
+    point-in-time correctness for free, it never needs to know what fold
+    it's in.
+    """
+    allowed = set(allowed_classes)
+
+    def scope_fn(train_df):
+        seg = classify_fn(train_df)
+        return set(seg.loc[seg[segment_col].isin(allowed), "sku_id"])
+
+    return scope_fn
+
+def assert_scopes_exhaustive(full_panel, active_windows, origin, scope_fns,
+                              classify_fn=classify_sb, segment_col="sb_class",
+                              window_months=None):
+    """
+    Confirms a set of scope_fns jointly cover every SKU known at origin, and
+    don't overlap. Run this once per pair of branches you build, not on
+    every backtest call.
+    """
+    train_df = train_frame(full_panel, origin, window_months=window_months)
+    known = active_skus_at(active_windows, origin)
+
+    scoped_sets = [sf(train_df) for sf in scope_fns]
+    union = set().union(*scoped_sets)
+    overlap = set()
+    for i in range(len(scoped_sets)):
+        for j in range(i + 1, len(scoped_sets)):
+            overlap |= scoped_sets[i] & scoped_sets[j]
+
+    missing = known - union
+    assert not missing, f"{len(missing)} known-at-origin SKUs fall in no scope: {list(missing)[:10]}"
+    assert not overlap, f"{len(overlap)} SKUs fall in more than one scope: {list(overlap)[:10]}"
+    return True
+
+
 def segment_scope(forecast_fn, allowed_classes, classify_fn=classify_sb, segment_col="sb_class"):
     """
     Wraps a plain forecast_fn(train_df, horizon, **kwargs) -> DataFrame so it
@@ -2227,3 +2294,21 @@ def combine_segment_results(*results_dfs, on=("origin", "target_date")):
 #         preds = forecast_fn(fold["train_df"], horizon=len(fold["horizon_dates"]), **params)
 #         all_segs.append(_score_fold_segments(fold, preds, sku_segment, segment_col=segment_col))
 #     return pd.concat(all_segs, ignore_index=True)
+
+
+# NOTEBOOK ONLY
+naive_unscoped, _ = run_backtest(naive_moving_average, full_panel, windows, params={"window": 3},collect_predictions=True)
+
+naive_head, _ = run_backtest(naive_moving_average, full_panel, windows, params={"window": 3},collect_predictions=True,
+                              scope_fn=scope_to("Smooth", "Erratic"))
+naive_tail, _ = run_backtest(naive_moving_average, full_panel, windows, params={"window": 3},collect_predictions=True,
+                              scope_fn=scope_to("Intermittent", "Lumpy", "NoDemand"))
+
+naive_recombined = combine_segment_results(naive_head, naive_tail)
+
+pd.testing.assert_series_equal(
+    naive_unscoped.sort_values("origin")["wmape"].reset_index(drop=True),
+    naive_recombined.sort_values("origin")["wmape"].reset_index(drop=True),
+    check_exact=False, rtol=1e-9,
+)
+print("scoped + recombined matches unscoped exactly — safe to trust scoped runs.")
