@@ -16,7 +16,7 @@ from optuna.storages import RDBStorage
 
 from eptools.modelling import (
     get_collision_sales_df, get_sku_active_windows, build_full_panel, classify_sb,
-    segment_scope, run_backtest, pooled_wmape,
+    scope_to, run_backtest, pooled_wmape,
     rolling_average_wmape, validate_forecast_fn,
 )
 
@@ -50,7 +50,8 @@ def build_study_name(model_name, sb_class, min_train_months, dataset_tag="v1"):
 
 
 def make_objective(forecast_fn, search_space, panel, panel_windows,
-                   min_train_months, objective_metric, cold_start_strategy="zero"):
+                   min_train_months, objective_metric, cold_start_strategy="zero",
+                   scope_fn=None):
     """Build the Optuna objective for one class's panel.
 
     Records BOTH pooled and 3-month-rolling WMAPE on every trial regardless of
@@ -64,6 +65,12 @@ def make_objective(forecast_fn, search_space, panel, panel_windows,
     default would abort almost every trial immediately. "zero" scores those
     as an explicit zero forecast instead, matching this module's older,
     pre-strict-validation behaviour.
+
+    scope_fn: passed straight through to run_backtest. Narrows the fold's
+    known-at-origin/test universe to match whatever SKUs forecast_fn is
+    actually being asked to predict (e.g. scope_to(sb_class)) -- without
+    this, a forecast_fn that only predicts a subset of known SKUs fails
+    run_backtest's "every known SKU must get a prediction" check.
     """
     def objective(trial):
         params = search_space(trial)
@@ -71,6 +78,7 @@ def make_objective(forecast_fn, search_space, panel, panel_windows,
             forecast_fn, panel, panel_windows,
             params=params, min_train_months=min_train_months,
             cold_start_strategy=cold_start_strategy,
+            scope_fn=scope_fn,
         )
         pooled = float(pooled_wmape(results))
         rolling = rolling_average_wmape(results, window=3, method="pooled")
@@ -189,15 +197,22 @@ def tune_over_sb_classes(forecast_fn, search_space, *, model_name,
 
     Routing notes
     -------------
-    Each class's study is scored via segment_scope(forecast_fn, [sb_class]),
-    which reclassifies every fold from that fold's own train_df -- so a SKU
-    that drifts class over its life (e.g. Lumpy -> Smooth) is scored under
-    whichever class it actually was at that fold's origin, not whatever it
-    ends up classified as over its full history. sb_lookup (retrospective,
-    whole-panel classify_sb) is used ONLY to report a current SKU count per
-    class -- never to decide which SKUs a fold forecasts. See classify_sb's
-    own docstring: the retrospective label is for slicing/reporting, not
-    routing.
+    Each class's study is scored via scope_fn=scope_to(sb_class), passed
+    through to run_backtest. scope_to() reclassifies every fold from that
+    fold's own train_df (via classify_sb), so a SKU that drifts class over
+    its life (e.g. Lumpy -> Smooth) is scored under whichever class it
+    actually was at that fold's origin, not whatever it ends up classified
+    as over its full history. Critically, scope_fn also narrows the fold's
+    known-at-origin/test universe to the same class -- forecast_fn is only
+    ever asked to predict its own class's SKUs, so run_backtest's "every
+    known SKU must get a prediction" check stays satisfied (the older
+    segment_scope() wrapper only filtered forecast_fn's inputs/outputs, not
+    the fold's expected universe, which made it incompatible with that
+    check -- see MODELLING.ipynb's _apply_scope for the fix).
+    sb_lookup (retrospective, whole-panel classify_sb) is used ONLY to
+    report a current SKU count per class -- never to decide which SKUs a
+    fold forecasts. See classify_sb's own docstring: the retrospective
+    label is for slicing/reporting, not routing.
 
     Returns
     -------
@@ -228,9 +243,8 @@ def tune_over_sb_classes(forecast_fn, search_space, *, model_name,
     try:
       for sb_class in sb_classes:
           # Reporting only -- see "Routing notes" above. Actual per-fold
-          # routing happens inside segment_scope via point-in-time classify_sb.
+          # routing happens inside scope_to(sb_class) via point-in-time classify_sb.
           n_skus_now = int((sb_lookup["sb_class"] == sb_class).sum())
-          scoped_forecast_fn = segment_scope(forecast_fn, allowed_classes=[sb_class])
 
           study = optuna.create_study(
               study_name=build_study_name(model_name, sb_class, min_train_months, dataset_tag),
@@ -243,9 +257,10 @@ def tune_over_sb_classes(forecast_fn, search_space, *, model_name,
           study.set_user_attr("objective_metric", objective_metric)
           study.set_user_attr("n_skus", n_skus_now)
 
-          objective = make_objective(scoped_forecast_fn, search_space, full_panel, windows,
+          objective = make_objective(forecast_fn, search_space, full_panel, windows,
                                      min_train_months, objective_metric,
-                                     cold_start_strategy=cold_start_strategy)
+                                     cold_start_strategy=cold_start_strategy,
+                                     scope_fn=scope_to(sb_class))
 
           # catch=(Exception,) => a failing trial is marked FAILED rather than
           # aborting the whole sweep (e.g. a class too sparse to make folds).
