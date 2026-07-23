@@ -10,6 +10,8 @@ Contract recap:
   search_space(trial)                       -> dict of params
 """
 
+import os
+
 import optuna
 import pandas as pd
 from optuna.storages import RDBStorage
@@ -17,7 +19,7 @@ from optuna.storages import RDBStorage
 from eptools.modelling import (
     get_collision_sales_df, get_sku_active_windows, build_full_panel, classify_sb,
     scope_to, run_backtest, pooled_wmape,
-    rolling_average_wmape, validate_forecast_fn,
+    rolling_average_wmape, validate_forecast_fn, _resolve_data_path,
 )
 
 SB_CLASSES = ("Smooth", "Erratic", "Intermittent", "Lumpy")
@@ -40,6 +42,25 @@ def load_data_cached():
         sb_lookup = classify_sb(full_panel)
         _DATA_CACHE["bundle"] = (full_panel, windows, sb_lookup)
     return _DATA_CACHE["bundle"]
+
+
+def get_optuna_export_db_path(data_path=None) -> str:
+    """Return the local filesystem path to supabase_export.db.
+
+    Reuses eptools.modelling's _resolve_data_path for the same Colab / Mac /
+    Windows auto-discovery (or the EPTOOLS_DATA_PATH env var) load_dataframes
+    uses to find the DATA directory, then descends into OPTUNA_EXPORT -- no
+    path-detection logic duplicated here.
+
+    Args:
+        data_path: Optional override for the DATA directory (same semantics
+            as load_dataframes' data_path). Not the OPTUNA_EXPORT path itself.
+    """
+    resolved = _resolve_data_path(data_path)
+    db_path = os.path.join(resolved, "OPTUNA_EXPORT", "supabase_export.db")
+    if not os.path.exists(db_path):
+        raise FileNotFoundError(f"supabase_export.db not found at {db_path}")
+    return db_path
 
 
 def build_study_name(model_name, sb_class, min_train_months, dataset_tag="v1"):
